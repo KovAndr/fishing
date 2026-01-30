@@ -15,11 +15,10 @@ from telegram.ext import (
 
 # ================== НАСТРОЙКИ ==================
 
-# ВАЖНО: os.getenv() принимает имя переменной окружения, а не её значение!
-# Удали эти значения и установи их в Render как переменные окружения
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # ⚠️ Исправлено: только имя переменной
-YANDEX_API_KEY = os.getenv("YANDEX_API_KEY")  # ⚠️ Исправлено
-ORS_API_KEY = os.getenv("ORS_API_KEY")  # ⚠️ Исправлено
+# ⚠️ ВАЖНО: Уберите эти ключи из кода и используйте переменные окружения в Render!
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8551119224:AAG-OMVuDEvLAAlW2s8eOSbOmfczfh5Hnok")
+YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "d1702e0f-5f8d-492d-aab9-42d7fb196baa")
+ORS_API_KEY = os.getenv("ORS_API_KEY", "5b3ce3597851110001cf62487ffa9a9a8b94ef48a2dc3c9d32156537c7058eb31ab8cfbb8ff64b17")
 
 DEFAULT_START_COORDS = (47.2357, 39.7011)  # Ростов-на-Дону
 USER_START_POINTS = {}  # user_id -> (lat, lon)
@@ -113,18 +112,34 @@ async def set_start_point(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.document:
+        await update.message.reply_text("❌ Пожалуйста, отправьте файл DOCX")
+        return
+    
+    if not update.message.document.file_name.endswith('.docx'):
+        await update.message.reply_text("❌ Пожалуйста, отправьте файл в формате DOCX")
+        return
+    
     file = await update.message.document.get_file()
     user_id = update.message.from_user.id
 
-    docx_path = f"{user_id}.docx"
+    docx_path = f"temp_{user_id}_{int(time.time())}.docx"
     await file.download_to_drive(docx_path)
 
-    addresses = read_and_merge_addresses(docx_path)
+    try:
+        addresses = read_and_merge_addresses(docx_path)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка чтения файла: {e}")
+        if os.path.exists(docx_path):
+            os.remove(docx_path)
+        return
+    
     total = len(addresses)
 
     if total == 0:
         await update.message.reply_text("❌ В файле нет адресов")
-        os.remove(docx_path)
+        if os.path.exists(docx_path):
+            os.remove(docx_path)
         return
 
     progress_msg = await update.message.reply_text(
@@ -146,7 +161,7 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if coords:
             d1 = ors_route(start_coords, coords)
-            time.sleep(1)  # Уменьшил задержку для скорости
+            time.sleep(1)  # Задержка для избежания лимитов API
 
             if d1:
                 d2, d3 = variations(d1)
@@ -164,40 +179,54 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"📍 {addr[:60]}"
                 )
             except:
-                pass  # Игнорируем ошибки редактирования
+                pass
 
     try:
         await progress_msg.edit_text("✅ Готово! Отправляю файл…")
     except:
         pass
 
-    out_file = f"routes_{user_id}.xlsx"
+    out_file = f"routes_{user_id}_{int(time.time())}.xlsx"
     wb.save(out_file)
 
-    with open(out_file, "rb") as file:
-        await update.message.reply_document(document=file)
+    try:
+        with open(out_file, "rb") as file:
+            await update.message.reply_document(
+                document=file,
+                filename=f"маршруты_{user_id}.xlsx"
+            )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка отправки файла: {e}")
 
     # Очистка временных файлов
-    if os.path.exists(docx_path):
-        os.remove(docx_path)
-    if os.path.exists(out_file):
-        os.remove(out_file)
+    try:
+        if os.path.exists(docx_path):
+            os.remove(docx_path)
+        if os.path.exists(out_file):
+            os.remove(out_file)
+    except:
+        pass
 
 # ================== ЗАПУСК ==================
 
 def main():
-    # Проверка токена перед запуском
+    # Проверка токена
     if not BOT_TOKEN:
         print("❌ ОШИБКА: BOT_TOKEN не установлен!")
-        print("Установи переменную окружения BOT_TOKEN в Render")
+        print("Установите переменную окружения BOT_TOKEN в Render")
         exit(1)
     
     print(f"✅ Токен получен (длина: {len(BOT_TOKEN)})")
+    print(f"✅ Яндекс API ключ: {'установлен' if YANDEX_API_KEY else 'не установлен'}")
+    print(f"✅ ORS API ключ: {'установлен' if ORS_API_KEY else 'не установлен'}")
     
+    # Убедитесь, что используете правильный метод для версии 20.5
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("startpoint", set_start_point))
+    
+    # Для версии 20.5 может потребоваться другой фильтр
     app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
 
     print("🤖 Бот запущен...")
