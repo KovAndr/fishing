@@ -15,9 +15,11 @@ from telegram.ext import (
 
 # ================== НАСТРОЙКИ ==================
 
-BOT_TOKEN = os.getenv("8551119224:AAG-OMVuDEvLAAlW2s8eOSbOmfczfh5Hnok")
-YANDEX_API_KEY = os.getenv("d1702e0f-5f8d-492d-aab9-42d7fb196baa")
-ORS_API_KEY = os.getenv("5b3ce3597851110001cf62487ffa9a9a8b94ef48a2dc3c9d32156537c7058eb31ab8cfbb8ff64b17")
+# ВАЖНО: os.getenv() принимает имя переменной окружения, а не её значение!
+# Удали эти значения и установи их в Render как переменные окружения
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # ⚠️ Исправлено: только имя переменной
+YANDEX_API_KEY = os.getenv("YANDEX_API_KEY")  # ⚠️ Исправлено
+ORS_API_KEY = os.getenv("ORS_API_KEY")  # ⚠️ Исправлено
 
 DEFAULT_START_COORDS = (47.2357, 39.7011)  # Ростов-на-Дону
 USER_START_POINTS = {}  # user_id -> (lat, lon)
@@ -30,6 +32,10 @@ def read_and_merge_addresses(path):
     return [l for l in lines if len(l) > 10 and not l.replace(' ', '').isdigit()]
 
 def yandex_geocode(address):
+    if not YANDEX_API_KEY:
+        print("⚠️ YANDEX_API_KEY не установлен!")
+        return None
+    
     url = "https://geocode-maps.yandex.ru/1.x/"
     params = {
         "apikey": YANDEX_API_KEY,
@@ -37,27 +43,35 @@ def yandex_geocode(address):
         "geocode": address,
         "results": 1
     }
-    r = requests.get(url, params=params, timeout=15)
-    if r.status_code != 200:
-        return None
     try:
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code != 200:
+            print(f"⚠️ Ошибка геокодирования: {r.status_code}")
+            return None
         pos = r.json()["response"]["GeoObjectCollection"]["featureMember"][0]["GeoObject"]["Point"]["pos"]
         lon, lat = pos.split()
         return float(lat), float(lon)
-    except:
+    except Exception as e:
+        print(f"⚠️ Ошибка при геокодировании: {e}")
         return None
 
 def ors_route(start, end):
+    if not ORS_API_KEY:
+        print("⚠️ ORS_API_KEY не установлен!")
+        return None
+    
     url = "https://api.openrouteservice.org/v2/directions/driving-car/geojson"
     headers = {"Authorization": ORS_API_KEY}
     body = {"coordinates": [[start[1], start[0]], [end[1], end[0]]]}
-    r = requests.post(url, json=body, headers=headers, timeout=20)
-    if r.status_code != 200:
-        return None
     try:
+        r = requests.post(url, json=body, headers=headers, timeout=20)
+        if r.status_code != 200:
+            print(f"⚠️ Ошибка маршрута: {r.status_code}")
+            return None
         dist = r.json()["features"][0]["properties"]["summary"]["distance"]
         return round(dist / 1000, 1)
-    except:
+    except Exception as e:
+        print(f"⚠️ Ошибка при построении маршрута: {e}")
         return None
 
 def variations(base):
@@ -110,6 +124,7 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if total == 0:
         await update.message.reply_text("❌ В файле нет адресов")
+        os.remove(docx_path)
         return
 
     progress_msg = await update.message.reply_text(
@@ -131,7 +146,7 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if coords:
             d1 = ors_route(start_coords, coords)
-            time.sleep(3)
+            time.sleep(1)  # Уменьшил задержку для скорости
 
             if d1:
                 d2, d3 = variations(d1)
@@ -143,30 +158,49 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ws.append([i, addr, None, None, None, None, None])
 
         if i % 2 == 0 or i == total:
-            await progress_msg.edit_text(
-                f"⏳ Обработка: {i} / {total}\n"
-                f"📍 {addr[:60]}"
-            )
+            try:
+                await progress_msg.edit_text(
+                    f"⏳ Обработка: {i} / {total}\n"
+                    f"📍 {addr[:60]}"
+                )
+            except:
+                pass  # Игнорируем ошибки редактирования
 
-    await progress_msg.edit_text("✅ Готово! Отправляю файл…")
+    try:
+        await progress_msg.edit_text("✅ Готово! Отправляю файл…")
+    except:
+        pass
 
     out_file = f"routes_{user_id}.xlsx"
     wb.save(out_file)
 
-    await update.message.reply_document(document=open(out_file, "rb"))
+    with open(out_file, "rb") as file:
+        await update.message.reply_document(document=file)
 
-    os.remove(docx_path)
-    os.remove(out_file)
+    # Очистка временных файлов
+    if os.path.exists(docx_path):
+        os.remove(docx_path)
+    if os.path.exists(out_file):
+        os.remove(out_file)
 
 # ================== ЗАПУСК ==================
 
 def main():
+    # Проверка токена перед запуском
+    if not BOT_TOKEN:
+        print("❌ ОШИБКА: BOT_TOKEN не установлен!")
+        print("Установи переменную окружения BOT_TOKEN в Render")
+        exit(1)
+    
+    print(f"✅ Токен получен (длина: {len(BOT_TOKEN)})")
+    
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("startpoint", set_start_point))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
 
+    print("🤖 Бот запущен...")
     app.run_polling()
 
 if __name__ == "__main__":
