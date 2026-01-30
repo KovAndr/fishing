@@ -4,6 +4,7 @@ import random
 import time
 import os
 import threading
+import asyncio
 from docx import Document
 from telegram import Update
 from telegram.ext import (
@@ -14,9 +15,9 @@ from telegram.ext import (
     filters
 )
 from flask import Flask
+from telegram.error import Conflict
 
 # ================== ФЛАСК ДЛЯ RENDER ==================
-# Создаем Flask приложение для проверки здоровья
 app = Flask(__name__)
 
 @app.route('/')
@@ -27,7 +28,6 @@ def home():
     <head>
         <title>Telegram Route Bot</title>
         <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             body {
                 font-family: Arial, sans-serif;
@@ -53,12 +53,6 @@ def home():
             h1 {
                 font-size: 2.5em;
                 margin-bottom: 20px;
-                text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
-            }
-            p {
-                font-size: 1.2em;
-                margin-bottom: 30px;
-                line-height: 1.6;
             }
             .status {
                 background: rgba(255, 255, 255, 0.2);
@@ -67,96 +61,41 @@ def home():
                 margin: 20px 0;
                 font-family: monospace;
             }
-            .telegram-btn {
-                display: inline-block;
-                background: #0088cc;
-                color: white;
-                padding: 15px 30px;
-                text-decoration: none;
-                border-radius: 50px;
-                font-size: 1.1em;
-                font-weight: bold;
-                margin-top: 20px;
-                transition: all 0.3s ease;
-                border: 2px solid rgba(255, 255, 255, 0.3);
-            }
-            .telegram-btn:hover {
-                background: #006699;
-                transform: translateY(-2px);
-                box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
-            }
-            .emoji {
-                font-size: 3em;
-                margin-bottom: 20px;
-            }
         </style>
     </head>
     <body>
         <div class="container">
-            <div class="emoji">🤖</div>
-            <h1>Telegram Route Bot</h1>
-            <p>Бот для расчета маршрутов успешно запущен и работает!</p>
+            <h1>🤖 Telegram Route Bot</h1>
+            <p>Бот для расчета маршрутов успешно запущен!</p>
             <div class="status">
                 ✅ Статус: <strong>АКТИВЕН</strong><br>
-                ⏰ Время работы: {uptime}<br>
-                📊 Обработано пользователей: {users_count}<br>
-                🔑 API Яндекс: {yandex_status}<br>
-                🔑 API ORS: {ors_status}
+                📍 Режим: Web Service<br>
+                🚀 Платформа: Render
             </div>
             <p>Используйте бота в Telegram для расчета маршрутов</p>
-            <a href="https://t.me/{bot_username}" class="telegram-btn" target="_blank">
-                📲 Перейти в бота
-            </a>
         </div>
     </body>
     </html>
-    """.format(
-        uptime=time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time)),
-        users_count=len(USER_START_POINTS),
-        yandex_status="✅" if YANDEX_API_KEY and YANDEX_API_KEY != "d1702e0f-5f8d-492d-aab9-42d7fb196baa" else "⚠️",
-        ors_status="✅" if ORS_API_KEY and ORS_API_KEY != "5b3ce3597851110001cf62487ffa9a9a8b94ef48a2dc3c9d32156537c7058eb31ab8cfbb8ff64b17" else "⚠️",
-        bot_username=bot_username
-    )
+    """
 
 @app.route('/health')
 def health():
-    """Маршрут для проверки здоровья (используется Render)"""
-    return {"status": "ok", "timestamp": time.time(), "service": "telegram-route-bot"}, 200
-
-@app.route('/status')
-def status():
-    """Статус бота"""
-    return {
-        "status": "running",
-        "bot_username": bot_username,
-        "users_count": len(USER_START_POINTS),
-        "yandex_api": "configured" if YANDEX_API_KEY and YANDEX_API_KEY != "d1702e0f-5f8d-492d-aab9-42d7fb196baa" else "using_default",
-        "ors_api": "configured" if ORS_API_KEY and ORS_API_KEY != "5b3ce3597851110001cf62487ffa9a9a8b94ef48a2dc3c9d32156537c7058eb31ab8cfbb8ff64b17" else "using_default",
-        "uptime": time.time() - start_time
-    }
+    return {"status": "ok", "service": "telegram-route-bot"}, 200
 
 def run_flask():
-    """Запускает Flask сервер"""
     port = int(os.environ.get('PORT', 10000))
-    print(f"🌐 Запускаем Flask сервер на порту {port}")
+    print(f"🌐 Flask сервер запущен на порту {port}")
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # ================== НАСТРОЙКИ БОТА ==================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "")
+ORS_API_KEY = os.getenv("ORS_API_KEY", "")
 
-# ⚠️ ВАЖНО: Используйте переменные окружения в Render!
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8551119224:AAG-OMVuDEvLAAlW2s8eOSbOmfczfh5Hnok")
-YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "d1702e0f-5f8d-492d-aab9-42d7fb196baa")
-ORS_API_KEY = os.getenv("ORS_API_KEY", "5b3ce3597851110001cf62487ffa9a9a8b94ef48a2dc3c9d32156537c7058eb31ab8cfbb8ff64b17")
-
-DEFAULT_START_COORDS = (47.2357, 39.7011)  # Ростов-на-Дону
-USER_START_POINTS = {}  # user_id -> (lat, lon)
-
-# Глобальные переменные
-start_time = time.time()
-bot_username = None
+DEFAULT_START_COORDS = (47.2357, 39.7011)
+USER_START_POINTS = {}
 
 # ================== ЛОГИКА БОТА ==================
-
 def read_and_merge_addresses(path):
     doc = Document(path)
     lines = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
@@ -212,7 +151,6 @@ def variations(base):
     ]
 
 # ================== TELEGRAM БОТ ==================
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет!\n\n"
@@ -293,7 +231,7 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if coords:
             d1 = ors_route(start_coords, coords)
-            time.sleep(1)  # Задержка для избежания лимитов API
+            time.sleep(1)
 
             if d1:
                 d2, d3 = variations(d1)
@@ -330,7 +268,6 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка отправки файла: {e}")
 
-    # Очистка временных файлов
     try:
         if os.path.exists(docx_path):
             os.remove(docx_path)
@@ -339,24 +276,81 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-# ================== ЗАПУСК ==================
-
-def main():
-    global bot_username
+# ================== ЗАПУСК С ЗАЩИТОЙ ОТ КОНФЛИКТОВ ==================
+async def run_bot():
+    """Запускает бота с обработкой конфликтов"""
+    print("=" * 50)
+    print("🚀 ЗАПУСК ТЕЛЕГРАМ БОТА")
+    print("=" * 50)
     
-    # Проверка токена
     if not BOT_TOKEN:
         print("❌ ОШИБКА: BOT_TOKEN не установлен!")
         print("Установите переменную окружения BOT_TOKEN в Render")
-        exit(1)
+        return
     
-    print("=" * 50)
-    print("🚀 ЗАПУСК ТЕЛЕГРАМ БОТА ДЛЯ РАСЧЕТА МАРШРУТОВ")
-    print("=" * 50)
-    print(f"✅ Токен получен (длина: {len(BOT_TOKEN)})")
-    print(f"✅ Яндекс API ключ: {'установлен' if YANDEX_API_KEY else 'не установлен'}")
-    print(f"✅ ORS API ключ: {'установлен' if ORS_API_KEY else 'не установлен'}")
+    print(f"✅ Токен получен")
+    print(f"✅ Яндекс API: {'установлен' if YANDEX_API_KEY else 'не установлен'}")
+    print(f"✅ ORS API: {'установлен' if ORS_API_KEY else 'не установлен'}")
     
+    # Создаем приложение
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # Добавляем обработчики
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("startpoint", set_start_point))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
+    
+    # Пытаемся запустить бота с обработкой конфликтов
+    max_retries = 5
+    retry_delay = 10  # секунд
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"🔄 Попытка {attempt + 1}/{max_retries} запустить бота...")
+            await application.initialize()
+            await application.start()
+            
+            # Получаем информацию о боте
+            bot_info = await application.bot.get_me()
+            print(f"✅ Бот запущен: @{bot_info.username}")
+            
+            # Запускаем polling
+            await application.updater.start_polling(
+                drop_pending_updates=True,
+                timeout=30,
+                poll_interval=0.5
+            )
+            
+            print("🤖 Бот работает и ожидает сообщений...")
+            
+            # Бесконечный цикл (пока не будет остановлен)
+            while True:
+                await asyncio.sleep(3600)  # Спим час
+            
+        except Conflict as e:
+            print(f"⚠️ Конфликт: {e}")
+            print(f"⏳ Жду {retry_delay} секунд перед повторной попыткой...")
+            
+            # Останавливаем бота если он запущен
+            try:
+                await application.stop()
+                await application.shutdown()
+            except:
+                pass
+            
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # Экспоненциальная задержка
+            else:
+                print("❌ Достигнут лимит попыток. Бот не может запуститься.")
+                print("ℹ️ Проверьте, что нет других запущенных экземпляров бота.")
+                break
+                
+        except Exception as e:
+            print(f"❌ Ошибка: {e}")
+            break
+
+def main():
     # Проверяем, работаем ли на Render
     is_render = os.environ.get('RENDER') is not None
     port = os.environ.get('PORT')
@@ -367,35 +361,9 @@ def main():
         flask_thread = threading.Thread(target=run_flask, daemon=True)
         flask_thread.start()
         print("✅ Flask сервер запущен в отдельном потоке")
-    else:
-        print("💻 Локальный запуск (Flask не запущен)")
     
-    # Создаем приложение Telegram бота
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-    
-    # Получаем информацию о боте для username
-    try:
-        bot_info = application.bot.get_me()
-        bot_username = bot_info.username
-        print(f"🤖 Бот: @{bot_username}")
-        print(f"📛 Имя: {bot_info.first_name}")
-    except Exception as e:
-        print(f"⚠️ Не удалось получить информацию о боте: {e}")
-        bot_username = "unknown_bot"
-    
-    # Добавляем обработчики
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("startpoint", set_start_point))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
-    
-    print("⏳ Запускаем бота...")
-    print("=" * 50)
-    
-    # Запускаем бота с polling
-    application.run_polling(
-        drop_pending_updates=True,  # Игнорируем старые сообщения при запуске
-        allowed_updates=Update.ALL_TYPES
-    )
+    # Запускаем бота
+    asyncio.run(run_bot())
 
 if __name__ == "__main__":
     main()
