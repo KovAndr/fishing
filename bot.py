@@ -15,7 +15,7 @@ from telegram.ext import (
 
 # ================== НАСТРОЙКИ ==================
 
-BOT_TOKEN = os.getenv("8551119224:AAG-OMVuDEvLAAlW2s8eOSbOmfczfh5Hnok")
+BOT_TOKEN = os.getenv("AAG-OMVuDEvLAAlW2s8eOSbOmfczfh5Hnok")
 YANDEX_API_KEY = os.getenv("d1702e0f-5f8d-492d-aab9-42d7fb196baa")
 ORS_API_KEY = os.getenv("5b3ce3597851110001cf62487ffa9a9a8b94ef48a2dc3c9d32156537c7058eb31ab8cfbb8ff64b17")
 
