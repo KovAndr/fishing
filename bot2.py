@@ -5,6 +5,9 @@ import time
 import os
 import threading
 import asyncio
+import re
+import json
+from datetime import datetime
 from docx import Document
 from telegram import Update
 from telegram.ext import (
@@ -17,7 +20,7 @@ from telegram.ext import (
 from flask import Flask
 from telegram.error import Conflict
 from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 # ================== ФЛАСК ДЛЯ RENDER ==================
 app = Flask(__name__)
@@ -94,15 +97,97 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "")
 ORS_API_KEY = os.getenv("ORS_API_KEY", "")
 
-# ================== ЛОГИКА БОТА ==================
-def read_from_docx(path):
-    """Чтение адресов из DOCX файла"""
-    doc = Document(path)
-    lines = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-    return [l for l in lines if len(l) > 10 and not l.replace(' ', '').isdigit()]
+# Кэш для геокодирования
+GEOCODE_CACHE = {}
+# Максимальное количество точек в маршруте для ORS
+MAX_WAYPOINTS = 25
 
+# ================== УТИЛИТЫ ==================
+def normalize_address(address):
+    """Нормализация адреса"""
+    if not address:
+        return ""
+    
+    # Удаляем лишние пробелы
+    address = re.sub(r'\s+', ' ', address.strip())
+    
+    # Стандартизируем обозначения
+    replacements = {
+        'обл.': 'область',
+        'г.': 'город',
+        'ул.': 'улица',
+        'пр.': 'проспект',
+        'пр-т': 'проспект',
+        'пер.': 'переулок',
+        'д.': 'дом',
+        'с.': 'село',
+        'п.': 'поселок',
+        'р-н': 'район',
+        'р.': 'республика',
+        'ст-ца': 'станица',
+        'мкр.': 'микрорайон',
+        'к.': 'корпус',
+        'стр.': 'строение',
+        'вл.': 'владение',
+    }
+    
+    for short, full in replacements.items():
+        address = re.sub(rf'\b{re.escape(short)}\b', full, address, flags=re.IGNORECASE)
+    
+    # Добавляем Россию, если не указано
+    if not any(word in address.lower() for word in ['россия', 'russia', 'рф']):
+        # Проверяем, не является ли адрес зарубежным
+        if not any(word in address.lower() for word in ['украина', 'беларусь', 'казахстан']):
+            address = f'Россия, {address}'
+    
+    return address
+
+def parse_address_chain(address_string):
+    """Парсит цепочку адресов с улучшенной логикой"""
+    if not address_string:
+        return []
+    
+    # Нормализуем строку
+    address_string = str(address_string).strip()
+    
+    # Заменяем различные разделители
+    address_string = re.sub(r'[–—]', '-', address_string)
+    
+    # Обрабатываем сложные случаи с дефисами в названиях
+    # Разделяем по дефису, который стоит после пробела или в начале строки
+    parts = []
+    current_part = ""
+    
+    # Простой алгоритм: делим по дефисам, но объединяем части, которые выглядят как продолжение адреса
+    temp_parts = address_string.split('-')
+    
+    for i, part in enumerate(temp_parts):
+        part = part.strip()
+        if not part:
+            continue
+            
+        # Если часть начинается с маленькой буквы или это номер дома, присоединяем к предыдущей
+        if i > 0 and (part[0].islower() or re.match(r'^\d+[а-яА-Я]?$', part)):
+            parts[-1] = f"{parts[-1]}-{part}"
+        else:
+            parts.append(part)
+    
+    # Фильтруем и нормализуем
+    addresses = [normalize_address(addr) for addr in parts if addr]
+    
+    # Удаляем дубликаты
+    unique_addresses = []
+    seen = set()
+    for addr in addresses:
+        if addr not in seen:
+            unique_addresses.append(addr)
+            seen.add(addr)
+    
+    return unique_addresses
+
+# ================== ЛОГИКА БОТА ==================
 def read_from_excel(path):
-    """Чтение маршрутов из Excel файла с двумя колонками: стартовая точка и цепочка адресов"""
+    """Чтение маршрутов из Excel файла"""
     wb = load_workbook(path, data_only=True)
     ws = wb.active
     routes = []
@@ -111,9 +196,16 @@ def read_from_excel(path):
     max_row = ws.max_row
     
     # Читаем данные, пропуская заголовки если они есть
-    for row in range(1, max_row + 1):
-        start_point = ws.cell(row=row, column=1).value  # Колонка A
-        address_chain = ws.cell(row=row, column=2).value  # Колонка B
+    start_row = 1
+    if ws.cell(row=1, column=1).value and isinstance(ws.cell(row=1, column=1).value, str):
+        # Проверяем, является ли первая строка заголовком
+        header1 = str(ws.cell(row=1, column=1).value).lower()
+        if any(word in header1 for word in ['пункт', 'адрес', 'грузоотправитель']):
+            start_row = 2
+    
+    for row in range(start_row, max_row + 1):
+        start_point = ws.cell(row=row, column=1).value
+        address_chain = ws.cell(row=row, column=2).value
         
         # Проверяем, что есть оба значения
         if start_point and address_chain:
@@ -127,53 +219,136 @@ def read_from_excel(path):
     
     return routes, wb, ws
 
-def parse_address_chain(address_string):
-    """Парсит цепочку адресов, разделенных дефисами"""
-    if not address_string:
-        return []
-    
-    # Заменяем различные тире на обычный дефис
-    address_string = address_string.replace('–', '-').replace('—', '-')
-    
-    # Разделяем по дефису и очищаем
-    addresses = [addr.strip() for addr in address_string.split('-') if addr.strip()]
-    return addresses
-
-def yandex_geocode(address):
-    """Геокодирование адреса через Яндекс API"""
+def yandex_geocode(address, max_retries=3):
+    """Улучшенное геокодирование с проверкой координат"""
     if not YANDEX_API_KEY:
         print("⚠️ YANDEX_API_KEY не установлен!")
         return None
     
+    # Проверяем кэш
+    cache_key = address.lower()
+    if cache_key in GEOCODE_CACHE:
+        return GEOCODE_CACHE[cache_key]
+    
     url = "https://geocode-maps.yandex.ru/1.x/"
-    params = {
-        "apikey": YANDEX_API_KEY,
-        "format": "json",
-        "geocode": address,
-        "results": 1
+    
+    for attempt in range(max_retries):
+        try:
+            params = {
+                "apikey": YANDEX_API_KEY,
+                "format": "json",
+                "geocode": address,
+                "results": 1,
+                "lang": "ru_RU"
+            }
+            
+            r = requests.get(url, params=params, timeout=20)
+            
+            if r.status_code != 200:
+                print(f"⚠️ Ошибка геокодирования {address}: {r.status_code}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                return None
+            
+            data = r.json()
+            
+            if (data["response"]["GeoObjectCollection"]["featureMember"] and 
+                len(data["response"]["GeoObjectCollection"]["featureMember"]) > 0):
+                
+                feature = data["response"]["GeoObjectCollection"]["featureMember"][0]["GeoObject"]
+                pos = feature["Point"]["pos"]
+                lon, lat = pos.split()
+                coords = (float(lat), float(lon))
+                
+                # Проверяем, что координаты в разумных пределах для России
+                if is_valid_russian_coords(coords):
+                    GEOCODE_CACHE[cache_key] = coords
+                    return coords
+                else:
+                    print(f"⚠️ Координаты вне России для адреса: {address}")
+                    # Пробуем альтернативный вариант
+                    alternative_address = try_alternative_address(address)
+                    if alternative_address and alternative_address != address:
+                        return yandex_geocode(alternative_address, max_retries=1)
+                    return None
+            else:
+                print(f"⚠️ Адрес не найден: {address}")
+                # Пробуем альтернативный вариант
+                alternative_address = try_alternative_address(address)
+                if alternative_address and alternative_address != address:
+                    return yandex_geocode(alternative_address, max_retries=1)
+                return None
+                
+        except Exception as e:
+            print(f"⚠️ Ошибка при геокодировании {address}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+    
+    return None
+
+def is_valid_russian_coords(coords):
+    """Проверка, что координаты находятся в пределах России"""
+    if not coords:
+        return False
+    
+    lat, lon = coords
+    
+    # Примерные границы России (включая Крым)
+    min_lat, max_lat = 41.0, 82.0  # Широта
+    min_lon, max_lon = 19.0, 190.0  # Долгота (включая Чукотку)
+    
+    # Проверяем основные границы
+    if not (min_lat <= lat <= max_lat and min_lon <= lon <= max_lon):
+        return False
+    
+    # Дополнительные проверки для исключения очевидных ошибок
+    # Координаты в Швейцарии и т.п.
+    suspicious_coords = [
+        (47.427551, 9.377873),  # Швейцария
+        (31.474271, 74.402927),  # Пакистан
+        (-12.057917, -77.106686),  # Перу
+        (4.612851, -74.096036),  # Колумбия
+    ]
+    
+    for sus_lat, sus_lon in suspicious_coords:
+        if abs(lat - sus_lat) < 0.1 and abs(lon - sus_lon) < 0.1:
+            return False
+    
+    return True
+
+def try_alternative_address(address):
+    """Попытка исправить адрес"""
+    # Удаляем лишние части
+    address = address.strip()
+    
+    # Удаляем индекс в начале
+    address = re.sub(r'^\d{6},\s*', '', address)
+    
+    # Исправляем опечатки в названиях регионов
+    corrections = {
+        'Кверля': 'Карелия',
+        'Бедгородская': 'Белгородская',
+        'Нижегородкская': 'Нижегородская',
+        'Крамский': 'Краснодарский',
+        'Московкская': 'Московская',
+        'Вологдаская': 'Вологодская',
+        'Тамбовска': 'Тамбовская',
+        'Воронежска': 'Воронежская',
     }
     
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        if r.status_code != 200:
-            print(f"⚠️ Ошибка геокодирования: {r.status_code} для адреса: {address}")
-            return None
-        
-        data = r.json()
-        if (data["response"]["GeoObjectCollection"]["featureMember"] and 
-            len(data["response"]["GeoObjectCollection"]["featureMember"]) > 0):
-            pos = data["response"]["GeoObjectCollection"]["featureMember"][0]["GeoObject"]["Point"]["pos"]
-            lon, lat = pos.split()
-            return float(lat), float(lon)
-        else:
-            print(f"⚠️ Адрес не найден: {address}")
-            return None
-    except Exception as e:
-        print(f"⚠️ Ошибка при геокодировании {address}: {e}")
-        return None
+    for wrong, correct in corrections.items():
+        address = re.sub(rf'\b{wrong}\b', correct, address, flags=re.IGNORECASE)
+    
+    # Добавляем "Россия" если нет
+    if 'россия' not in address.lower():
+        address = f'Россия, {address}'
+    
+    return address
 
-def ors_route_with_waypoints(coordinates_list):
-    """Строит маршрут через промежуточные точки"""
+def ors_route_with_waypoints(coordinates_list, max_points_per_request=25):
+    """Построение маршрута с ограничением на количество точек"""
     if not ORS_API_KEY:
         print("⚠️ ORS_API_KEY не установлен!")
         return None
@@ -184,67 +359,142 @@ def ors_route_with_waypoints(coordinates_list):
     url = "https://api.openrouteservice.org/v2/directions/driving-car/geojson"
     headers = {"Authorization": ORS_API_KEY}
     
+    # Если точек слишком много, разбиваем на части
+    if len(coordinates_list) > max_points_per_request:
+        print(f"⚠️ Слишком много точек ({len(coordinates_list)}), разбиваю на части...")
+        
+        total_distance = 0
+        for i in range(0, len(coordinates_list) - 1):
+            segment_coords = [coordinates_list[i], coordinates_list[i + 1]]
+            segment_dist = ors_route_with_waypoints(segment_coords)
+            time.sleep(0.5)  # Задержка между запросами
+            
+            if segment_dist:
+                total_distance += segment_dist
+            else:
+                return None
+        
+        return round(total_distance, 1)
+    
     # Преобразуем координаты в формат [lon, lat]
     coordinates = [[coord[1], coord[0]] for coord in coordinates_list]
     
     body = {"coordinates": coordinates}
     
     try:
-        r = requests.post(url, json=body, headers=headers, timeout=30)
+        r = requests.post(url, json=body, headers=headers, timeout=45)
+        
         if r.status_code != 200:
             print(f"⚠️ Ошибка маршрута: {r.status_code}")
+            print(f"Ответ: {r.text[:500]}")
             return None
         
         data = r.json()
+        
         if data["features"] and data["features"][0]["properties"]["summary"]:
             dist = data["features"][0]["properties"]["summary"]["distance"]
             return round(dist / 1000, 1)
         else:
+            print(f"⚠️ Нет данных о маршруте в ответе")
             return None
+            
+    except requests.exceptions.Timeout:
+        print(f"⚠️ Таймаут при построении маршрута")
+        return None
     except Exception as e:
         print(f"⚠️ Ошибка при построении маршрута: {e}")
         return None
 
+def calculate_route_safely(coordinates):
+    """Безопасный расчет маршрута с обработкой ошибок"""
+    try:
+        # Проверяем координаты
+        valid_coords = []
+        for coord in coordinates:
+            if coord and is_valid_russian_coords(coord):
+                valid_coords.append(coord)
+            else:
+                print(f"⚠️ Пропускаю невалидные координаты: {coord}")
+        
+        if len(valid_coords) < 2:
+            print(f"⚠️ Недостаточно валидных координат: {len(valid_coords)}")
+            return None
+        
+        # Рассчитываем маршрут
+        distance = ors_route_with_waypoints(valid_coords)
+        return distance
+        
+    except Exception as e:
+        print(f"⚠️ Ошибка при безопасном расчете маршрута: {e}")
+        return None
+
 def variations(base):
     """Генерирует варианты расстояний"""
-    if base is None:
+    if base is None or base <= 0:
         return [None, None]
     
-    return [
-        round(base + random.uniform(5, 20), 1),
-        round(max(0, base - random.uniform(5, 20)), 1)
-    ]
+    try:
+        # Более реалистичные вариации
+        variation_percent = random.uniform(1.02, 1.08)  # 2-8% вариация
+        
+        d2 = round(base * variation_percent, 1)
+        d3 = round(base * (2 - variation_percent), 1)  # Симметричная вариация вниз
+        
+        # Гарантируем, что расстояния не отрицательные
+        d3 = max(0, d3)
+        
+        return [d2, d3]
+    except:
+        return [None, None]
 
 def add_result_columns(ws, start_col=3):
-    """Добавляет колонки для результатов в Excel"""
+    """Добавляет колонки для результатов в Excel с улучшенным форматированием"""
     headers = [
         "Статус обработки",
         "Координаты старта",
         "Координаты точек",
-        "Количество точек",
+        "Кол-во точек",
         "Тип маршрута",
         "Расстояние 1 (км)",
         "Расстояние 2 (км)",
-        "Расстояние 3 (км)"
+        "Расстояние 3 (км)",
+        "Примечания"
     ]
+    
+    # Стили
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    thin_border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
     
     # Добавляем заголовки
     for i, header in enumerate(headers):
         cell = ws.cell(row=1, column=start_col + i)
         cell.value = header
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill(start_color="FFE4B5", end_color="FFE4B5", fill_type="solid")
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = thin_border
     
-    # Автоматически настраиваем ширину колонок
-    for column in ws.columns:
-        max_length = 0
-        column_letter = column[0].column_letter
-        for cell in column:
-            if cell.value:
-                max_length = max(max_length, len(str(cell.value)))
-        adjusted_width = min(max_length + 2, 50)
-        ws.column_dimensions[column_letter].width = adjusted_width
+    # Настраиваем ширину колонок
+    column_widths = {
+        start_col: 20,    # Статус
+        start_col + 1: 25, # Коорд. старта
+        start_col + 2: 40, # Коорд. точек
+        start_col + 3: 12, # Кол-во
+        start_col + 4: 20, # Тип
+        start_col + 5: 15, # Расст. 1
+        start_col + 6: 15, # Расст. 2
+        start_col + 7: 15, # Расст. 3
+        start_col + 8: 30, # Примечания
+    }
+    
+    for col, width in column_widths.items():
+        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
     
     return start_col + len(headers)
 
@@ -255,11 +505,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Привет!\n\n"
         "📌 Я бот для расчета маршрутов с поддержкой промежуточных точек.\n\n"
         "📁 Отправьте мне Excel файл в формате:\n"
-        "• Колонка A: Стартовая точка (точка А)\n"
+        "• Колонка A: Стартовая точка\n"
         "• Колонка B: Цепочка адресов через дефис\n\n"
         "📊 Пример строки в колонке B:\n"
         "`г. Воронеж, ул. Ипподромная 18А - г. Сергиев Посад, ул. Кирова 89`\n\n"
-        "✅ Я верну тот же файл с добавленными колонками результатов!"
+        "✅ Я верну тот же файл с добавленными колонками результатов!\n\n"
+        "⚙️ Улучшенная версия: исправлены ошибки геокодирования и расчета маршрутов."
     )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -307,133 +558,189 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     progress_msg = await update.message.reply_text(
-        f"⏳ Начинаю обработку\nВсего строк: {total}\nОбработка..."
+        f"⏳ Начинаю обработку\nВсего строк: {total}\n"
+        f"📊 Версия: улучшенная с исправлением ошибок\n"
+        f"⏱️ Начало: {datetime.now().strftime('%H:%M:%S')}"
     )
     
     # Добавляем колонки для результатов
     start_col = add_result_columns(ws, start_col=3)
     
-    # Кэш для геокодированных адресов
-    geocode_cache = {}
+    # Сбрасываем кэш для нового пользователя
+    GEOCODE_CACHE.clear()
     
     processed = 0
-    errors = 0
+    successful = 0
+    geocode_errors = 0
+    route_errors = 0
+    
+    # Статистика
+    stats = {
+        'total': total,
+        'successful': 0,
+        'geocode_errors': 0,
+        'route_errors': 0,
+        'processing_times': []
+    }
     
     for route in routes:
+        start_time = time.time()
+        
         try:
             row_num = route['row_num']
-            start_point = route['start_point']
-            address_chain = route['address_chain']
+            original_start = route['start_point']
+            original_chain = route['address_chain']
+            
+            # Нормализуем адреса
+            normalized_start = normalize_address(original_start)
+            addresses = parse_address_chain(original_chain)
             
             # Геокодируем стартовую точку
-            if start_point in geocode_cache:
-                start_coords = geocode_cache[start_point]
-            else:
-                start_coords = yandex_geocode(start_point)
-                time.sleep(0.5)  # Задержка между запросами
-                if start_coords:
-                    geocode_cache[start_point] = start_coords
-            
-            # Парсим цепочку адресов
-            addresses = parse_address_chain(address_chain)
+            start_coords = yandex_geocode(normalized_start)
+            if not start_coords:
+                geocode_errors += 1
+                stats['geocode_errors'] += 1
+                
+                # Записываем ошибку
+                ws.cell(row=row_num, column=3).value = "❌ Ошибка геокодирования старта"
+                ws.cell(row=row_num, column=4).value = "Не найден"
+                ws.cell(row=row_num, column=5).value = ""
+                ws.cell(row=row_num, column=6).value = len(addresses)
+                ws.cell(row=row_num, column=7).value = "С промежуточными точками" if len(addresses) > 1 else "Прямой"
+                ws.cell(row=row_num, column=8).value = "Ошибка"
+                ws.cell(row=row_num, column=9).value = ""
+                ws.cell(row=row_num, column=10).value = ""
+                ws.cell(row=row_num, column=11).value = "Не удалось определить координаты стартовой точки"
+                
+                continue
             
             # Геокодируем все адреса в цепочке
             all_coords = []
             all_coords_str = []
-            geocode_errors = False
+            failed_addresses = []
             
-            for addr in addresses:
-                if addr in geocode_cache:
-                    coords = geocode_cache[addr]
-                else:
-                    coords = yandex_geocode(addr)
-                    time.sleep(0.5)  # Задержка между запросами
-                    if coords:
-                        geocode_cache[addr] = coords
+            for i, addr in enumerate(addresses):
+                normalized_addr = normalize_address(addr)
+                coords = yandex_geocode(normalized_addr)
                 
                 if coords:
                     all_coords.append(coords)
                     all_coords_str.append(f"{coords[0]:.6f},{coords[1]:.6f}")
                 else:
-                    geocode_errors = True
-                    break
+                    failed_addresses.append(f"Адрес {i+1}: {addr[:50]}...")
+                    all_coords.append(None)  # Помечаем как невалидный
+            
+            # Если есть ошибки геокодирования
+            if failed_addresses:
+                geocode_errors += 1
+                stats['geocode_errors'] += 1
+                
+                notes = "; ".join(failed_addresses)
+                ws.cell(row=row_num, column=3).value = "⚠️ Частичная ошибка геокодирования"
+                ws.cell(row=row_num, column=4).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
+                ws.cell(row=row_num, column=5).value = "; ".join([c for c in all_coords_str if c])
+                ws.cell(row=row_num, column=6).value = len(addresses)
+                ws.cell(row=row_num, column=7).value = "С промежуточными точками" if len(addresses) > 1 else "Прямой"
+                ws.cell(row=row_num, column=8).value = "Ошибка"
+                ws.cell(row=row_num, column=9).value = ""
+                ws.cell(row=row_num, column=10).value = ""
+                ws.cell(row=row_num, column=11).value = f"Не удалось геокодировать: {notes}"
+                
+                continue
             
             # Определяем тип маршрута
             route_type = "С промежуточными точками" if len(addresses) > 1 else "Прямой"
             
-            if geocode_errors or not start_coords or not all_coords:
-                # Записываем ошибку
-                ws.cell(row=row_num, column=3).value = "❌ Ошибка геокодирования"
-                ws.cell(row=row_num, column=4).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}" if start_coords else "Ошибка"
-                ws.cell(row=row_num, column=5).value = "; ".join(all_coords_str) if all_coords_str else "Ошибка"
+            # Строим маршрут: стартовая точка + все точки из цепочки
+            full_coordinates = [start_coords] + all_coords
+            
+            # Рассчитываем маршрут с обработкой ошибок
+            distance = calculate_route_safely(full_coordinates)
+            
+            if distance:
+                d2, d3 = variations(distance)
+                successful += 1
+                stats['successful'] += 1
+                
+                # Записываем успешный результат
+                ws.cell(row=row_num, column=3).value = "✅ Успешно"
+                ws.cell(row=row_num, column=4).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
+                ws.cell(row=row_num, column=5).value = "; ".join(all_coords_str)
+                ws.cell(row=row_num, column=6).value = len(addresses)
+                ws.cell(row=row_num, column=7).value = route_type
+                ws.cell(row=row_num, column=8).value = distance
+                ws.cell(row=row_num, column=9).value = d2
+                ws.cell(row=row_num, column=10).value = d3
+                ws.cell(row=row_num, column=11).value = ""
+                
+                # Форматируем ячейки с расстояниями
+                for col in [8, 9, 10]:
+                    cell = ws.cell(row=row_num, column=col)
+                    cell.number_format = '0.0'
+                    if col == 8:  # Основное расстояние
+                        cell.font = Font(bold=True)
+            else:
+                route_errors += 1
+                stats['route_errors'] += 1
+                
+                # Записываем ошибку расчета маршрута
+                ws.cell(row=row_num, column=3).value = "⚠️ Ошибка расчета маршрута"
+                ws.cell(row=row_num, column=4).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
+                ws.cell(row=row_num, column=5).value = "; ".join(all_coords_str)
                 ws.cell(row=row_num, column=6).value = len(addresses)
                 ws.cell(row=row_num, column=7).value = route_type
                 ws.cell(row=row_num, column=8).value = "Ошибка"
                 ws.cell(row=row_num, column=9).value = ""
                 ws.cell(row=row_num, column=10).value = ""
-                errors += 1
-            else:
-                # Строим маршрут: стартовая точка + все точки из цепочки
-                full_coordinates = [start_coords] + all_coords
-                
-                # Рассчитываем маршрут
-                distance = ors_route_with_waypoints(full_coordinates)
-                time.sleep(1)  # Задержка между запросами к ORS
-                
-                if distance:
-                    d2, d3 = variations(distance)
-                    
-                    # Записываем результаты
-                    ws.cell(row=row_num, column=3).value = "✅ Успешно"
-                    ws.cell(row=row_num, column=4).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
-                    ws.cell(row=row_num, column=5).value = "; ".join(all_coords_str)
-                    ws.cell(row=row_num, column=6).value = len(addresses)
-                    ws.cell(row=row_num, column=7).value = route_type
-                    ws.cell(row=row_num, column=8).value = distance
-                    ws.cell(row=row_num, column=9).value = d2
-                    ws.cell(row=row_num, column=10).value = d3
-                    
-                    # Форматируем ячейки с расстояниями
-                    for col in [8, 9, 10]:
-                        cell = ws.cell(row=row_num, column=col)
-                        cell.number_format = '0.0'
-                else:
-                    ws.cell(row=row_num, column=3).value = "⚠️ Ошибка расчета маршрута"
-                    ws.cell(row=row_num, column=4).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
-                    ws.cell(row=row_num, column=5).value = "; ".join(all_coords_str)
-                    ws.cell(row=row_num, column=6).value = len(addresses)
-                    ws.cell(row=row_num, column=7).value = route_type
-                    ws.cell(row=row_num, column=8).value = "Ошибка"
-                    ws.cell(row=row_num, column=9).value = ""
-                    ws.cell(row=row_num, column=10).value = ""
-                    errors += 1
+                ws.cell(row=row_num, column=11).value = "Не удалось построить маршрут между точками"
             
             processed += 1
             
             # Обновляем прогресс каждые 5 строк или в конце
             if processed % 5 == 0 or processed == total:
                 try:
-                    status = f"✅ {processed - errors}" if processed - errors > 0 else ""
-                    error_status = f"❌ {errors}" if errors > 0 else ""
+                    elapsed = time.time() - start_time
+                    stats['processing_times'].append(elapsed)
+                    avg_time = sum(stats['processing_times']) / len(stats['processing_times'])
                     
                     await progress_msg.edit_text(
                         f"⏳ Обработка: {processed} / {total}\n"
-                        f"{status} {error_status}\n"
-                        f"📍 Текущий: {start_point[:30]}..."
+                        f"✅ Успешно: {successful}\n"
+                        f"⚠️ Ошибки геокодирования: {geocode_errors}\n"
+                        f"⚠️ Ошибки маршрутов: {route_errors}\n"
+                        f"⏱️ Среднее время: {avg_time:.1f}с\n"
+                        f"📍 Текущий: {original_start[:30]}..."
                     )
                 except:
                     pass
                 
         except Exception as e:
-            print(f"Ошибка обработки строки {route.get('row_num', 'N/A')}: {e}")
-            errors += 1
+            print(f"❌ Критическая ошибка обработки строки {route.get('row_num', 'N/A')}: {e}")
+            processed += 1
+    
+    # Форматируем оставшиеся строки
+    for row in range(2, ws.max_row + 1):
+        for col in range(3, 12):  # Колонки с результатами
+            cell = ws.cell(row=row, column=col)
+            if cell.value:
+                cell.border = Border(
+                    left=Side(style='thin'),
+                    right=Side(style='thin'),
+                    top=Side(style='thin'),
+                    bottom=Side(style='thin')
+                )
     
     try:
+        total_time = sum(stats['processing_times'])
         await progress_msg.edit_text(
             f"✅ Обработка завершена!\n"
-            f"Успешно: {processed - errors}\n"
-            f"Ошибок: {errors}\n"
-            f"Формирую отчет..."
+            f"📊 Статистика:\n"
+            f"• Всего строк: {total}\n"
+            f"• Успешно: {successful}\n"
+            f"• Ошибки геокодирования: {geocode_errors}\n"
+            f"• Ошибки маршрутов: {route_errors}\n"
+            f"• Общее время: {total_time:.1f}с\n"
+            f"📄 Формирую отчет..."
         )
     except:
         pass
@@ -447,8 +754,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(output_file, "rb") as file:
             await update.message.reply_document(
                 document=file,
-                filename=f"результаты_{user_id}.xlsx",
-                caption=f"✅ Готово!\nУспешно обработано: {processed - errors} строк\nОшибок: {errors}"
+                filename=f"результаты_{user_id}_улучшенный.xlsx",
+                caption=(
+                    f"✅ Готово! Обработка завершена.\n"
+                    f"📊 Статистика:\n"
+                    f"• Всего строк: {total}\n"
+                    f"• ✅ Успешно: {successful}\n"
+                    f"• ⚠️ Ошибки геокодирования: {geocode_errors}\n"
+                    f"• ⚠️ Ошибки маршрутов: {route_errors}\n"
+                    f"• 🕐 Время: {datetime.now().strftime('%H:%M:%S')}"
+                )
             )
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка отправки файла: {e}")
@@ -465,51 +780,81 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help"""
     help_text = """
-📋 **Доступные команды:**
+📋 **Улучшенный бот для расчета маршрутов**
 
+**Что исправлено:**
+✅ Исправлено геокодирование адресов
+✅ Исправлены ошибки расчета маршрутов
+✅ Добавлена проверка координат
+✅ Улучшена обработка ошибок
+
+**Доступные команды:**
 /start - Начать работу с ботом
 /help - Показать эту справку
+/status - Проверить статус бота
 
-📁 **Формат Excel файла:**
+**📁 Формат Excel файла:**
 • Колонка A: Стартовая точка (точка А)
 • Колонка B: Цепочка адресов через дефис
 
-📍 **Пример строки в колонке B:**
+**📍 Пример строки в колонке B:**
 `г. Воронеж, ул. Ипподромная 18А - г. Сергиев Посад, ул. Кирова 89`
 
-📊 **Добавляемые колонки результатов:**
+**📊 Добавляемые колонки результатов:**
 1. Статус обработки
 2. Координаты старта
 3. Координаты точек
-4. Количество точек
+4. Кол-во точек
 5. Тип маршрута
 6. Расстояние 1 (км)
 7. Расстояние 2 (км)
 8. Расстояние 3 (км)
+9. Примечания
 
-**Типы маршрутов:**
-• Прямой - один адрес в цепочке
-• С промежуточными точками - несколько адресов через дефис
+**🚀 Особенности:**
+• Автоматическое исправление опечаток в адресах
+• Проверка координат на принадлежность к России
+• Обработка маршрутов с большим количеством точек
+• Подробная статистика обработки
 """
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
-async def example_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /example - отправляет пример файла"""
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /status"""
+    status_text = f"""
+🤖 **Статус бота**
+
+**Версия:** Улучшенная с исправлением ошибок
+**Дата:** {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}
+
+**API статус:**
+• Яндекс.Карты: {'✅ Доступен' if YANDEX_API_KEY else '❌ Не настроен'}
+• OpenRouteService: {'✅ Доступен' if ORS_API_KEY else '❌ Не настроен'}
+
+**Статистика кэша:**
+• Геокодированных адресов: {len(GEOCODE_CACHE)}
+
+**📊 Последняя обработка:**
+• Очистите кэш командой /clearcache при необходимости
+"""
+    await update.message.reply_text(status_text, parse_mode='Markdown')
+
+async def clearcache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Очистка кэша геокодирования"""
+    global GEOCODE_CACHE
+    old_size = len(GEOCODE_CACHE)
+    GEOCODE_CACHE.clear()
+    
     await update.message.reply_text(
-        "📋 Пример Excel файла:\n\n"
-        "| Колонка A | Колонка B |\n"
-        "|-----------|-----------|\n"
-        "| Ростов-на-Дону, Оганова 22 | г. Воронеж, ул. Ипподромная 18А |\n"
-        "| Ростов-на-Дону, Оганова 22 | г. Воронеж, ул. Ипподромная 18А - г. Сергиев Посад, ул. Кирова 89 |\n"
-        "| Ростов-на-Дону, Оганова 22 | р. Карелия, г. Петрозаводск, ул. Вольная 4 - г. Беломорск, ул. Мерецкова 6 |\n\n"
-        "Просто создайте Excel файл с такими данными и отправьте боту!"
+        f"✅ Кэш очищен\n"
+        f"🗑️ Удалено записей: {old_size}"
     )
 
 # ================== ЗАПУСК С ЗАЩИТОЙ ОТ КОНФЛИКТОВ ==================
 async def run_bot():
     """Запускает бота с обработкой конфликтов"""
     print("=" * 50)
-    print("🚀 ЗАПУСК ТЕЛЕГРАМ БОТА")
+    print("🚀 ЗАПУСК ТЕЛЕГРАМ БОТА (УЛУЧШЕННАЯ ВЕРСИЯ)")
     print("=" * 50)
     
     if not BOT_TOKEN:
@@ -520,6 +865,7 @@ async def run_bot():
     print(f"✅ Токен получен")
     print(f"✅ Яндекс API: {'установлен' if YANDEX_API_KEY else 'не установлен'}")
     print(f"✅ ORS API: {'установлен' if ORS_API_KEY else 'не установлен'}")
+    print(f"✅ Макс. точек в маршруте: {MAX_WAYPOINTS}")
     
     # Создаем приложение
     application = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -527,7 +873,8 @@ async def run_bot():
     # Добавляем обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("example", example_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("clearcache", clearcache_command))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
     # Пытаемся запустить бота с обработкой конфликтов
