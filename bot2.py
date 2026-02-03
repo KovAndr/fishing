@@ -5,532 +5,292 @@ import time
 import os
 import threading
 import asyncio
-import re
-import json
-from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from docx import Document
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters
 )
-from flask import Flask, request
+from flask import Flask
+from telegram.error import Conflict
 from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Font, PatternFill, Alignment
 
-# ================== FLASK FOR RENDER ==================
+# ================== ФЛАСК ДЛЯ RENDER ==================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is running"
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Telegram Route Bot</title>
+        <meta charset="utf-8">
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                max-width: 800px;
+                margin: 0 auto;
+                padding: 20px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            .container {
+                background: rgba(255, 255, 255, 0.1);
+                backdrop-filter: blur(10px);
+                border-radius: 20px;
+                padding: 40px;
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+                text-align: center;
+                border: 1px solid rgba(255, 255, 255, 0.2);
+            }
+            h1 {
+                font-size: 2.5em;
+                margin-bottom: 20px;
+            }
+            .status {
+                background: rgba(255, 255, 255, 0.2);
+                padding: 15px;
+                border-radius: 10px;
+                margin: 20px 0;
+                font-family: monospace;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🤖 Telegram Route Bot</h1>
+            <p>Бот для расчета маршрутов успешно запущен!</p>
+            <div class="status">
+                ✅ Статус: <strong>АКТИВЕН</strong><br>
+                📍 Режим: Web Service<br>
+                🚀 Платформа: Render
+            </div>
+            <p>Используйте бота в Telegram для расчета маршрутов</p>
+        </div>
+    </body>
+    </html>
+    """
 
 @app.route('/health')
 def health():
-    return {"status": "ok"}, 200
+    return {"status": "ok", "service": "telegram-route-bot"}, 200
 
-# ================== BOT SETTINGS ==================
+def run_flask():
+    port = int(os.environ.get('PORT', 10000))
+    print(f"🌐 Flask сервер запущен на порту {port}")
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+# ================== НАСТРОЙКИ БОТА ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "")
 ORS_API_KEY = os.getenv("ORS_API_KEY", "")
 
-# Cache for geocoding
-GEOCODE_CACHE = {}
-MAX_WAYPOINTS = 25
+# ================== ЛОГИКА БОТА ==================
+def read_from_docx(path):
+    """Чтение адресов из DOCX файла"""
+    doc = Document(path)
+    lines = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    return [l for l in lines if len(l) > 10 and not l.replace(' ', '').isdigit()]
 
-# ================== UTILITIES ==================
-def normalize_address(address):
-    """Normalize address with improved logic"""
-    if not address:
-        return ""
-    
-    address = re.sub(r'\s+', ' ', address.strip())
-    
-    replacements = {
-        'обл.': 'область',
-        'г.': 'город',
-        'ул.': 'улица',
-        'пр.': 'проспект',
-        'пр-т': 'проспект',
-        'пер.': 'переулок',
-        'д.': 'дом',
-        'с.': 'село',
-        'п.': 'поселок',
-        'р-н': 'район',
-        'р.': 'республика',
-        'ст-ца': 'станица',
-        'мкр.': 'микрорайон',
-        'к.': 'корпус',
-        'стр.': 'строение',
-        'вл.': 'владение',
-    }
-    
-    for short, full in replacements.items():
-        address = re.sub(rf'\b{re.escape(short)}\b', full, address, flags=re.IGNORECASE)
-    
-    # Add Russia if not specified
-    if not any(word in address.lower() for word in ['россия', 'russia', 'рф']):
-        if not any(word in address.lower() for word in ['украина', 'беларусь', 'казахстан']):
-            address = f'Россия, {address}'
-    
-    return address
-
-def parse_address_chain(address_string):
-    """Improved address parsing with better delimiter handling"""
-    if not address_string:
-        return []
-    
-    address_string = str(address_string).strip()
-    
-    # Replace different delimiters with standard one
-    address_string = re.sub(r'[–—]', '-', address_string)
-    
-    # Handle complex cases with hyphens in names
-    addresses = []
-    current_address = ""
-    in_parenthesis = False
-    
-    for char in address_string:
-        if char == '(':
-            in_parenthesis = True
-            current_address += char
-        elif char == ')':
-            in_parenthesis = False
-            current_address += char
-        elif char == '-' and not in_parenthesis:
-            if current_address.strip():
-                addresses.append(current_address.strip())
-                current_address = ""
-        else:
-            current_address += char
-    
-    if current_address.strip():
-        addresses.append(current_address.strip())
-    
-    # Filter and normalize
-    normalized = []
-    for addr in addresses:
-        norm_addr = normalize_address(addr)
-        if norm_addr and norm_addr not in normalized:
-            normalized.append(norm_addr)
-    
-    return normalized
-
-def yandex_geocode(address, max_retries=3):
-    """Improved geocoding with better error handling"""
-    global GEOCODE_CACHE  # Добавлено
-    
-    if not YANDEX_API_KEY:
-        print("⚠️ YANDEX_API_KEY not set!")
-        return None
-    
-    cache_key = address.lower()
-    if cache_key in GEOCODE_CACHE:
-        return GEOCODE_CACHE[cache_key]
-    
-    url = "https://geocode-maps.yandex.ru/1.x/"
-    
-    for attempt in range(max_retries):
-        try:
-            params = {
-                "apikey": YANDEX_API_KEY,
-                "format": "json",
-                "geocode": address,
-                "results": 1,
-                "lang": "ru_RU"
-            }
-            
-            r = requests.get(url, params=params, timeout=30)
-            
-            if r.status_code != 200:
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-                    continue
-                return None
-            
-            data = r.json()
-            
-            members = data.get("response", {}).get("GeoObjectCollection", {}).get("featureMember", [])
-            if members:
-                feature = members[0]["GeoObject"]
-                pos = feature["Point"]["pos"]
-                lon, lat = pos.split()
-                coords = (float(lat), float(lon))
-                
-                # Validate coordinates for Russia
-                if 40 <= lat <= 82 and 19 <= lon <= 190:
-                    GEOCODE_CACHE[cache_key] = coords
-                    return coords
-            
-            return None
-                
-        except Exception as e:
-            print(f"⚠️ Geocoding error {address}: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(2)
-                continue
-    
-    return None
-
-def ors_route_with_waypoints(coordinates_list, max_points_per_request=25):
-    """Route calculation with improved waypoint handling"""
-    if not ORS_API_KEY:
-        print("⚠️ ORS_API_KEY not set!")
-        return None
-    
-    if len(coordinates_list) < 2:
-        return None
-    
-    # If too many points, split into segments
-    if len(coordinates_list) > max_points_per_request:
-        total_distance = 0
-        
-        # Process in chunks
-        for i in range(0, len(coordinates_list)-1):
-            chunk = coordinates_list[i:i+2]
-            chunk_distance = ors_route_with_waypoints(chunk)
-            
-            if chunk_distance:
-                total_distance += chunk_distance
-            else:
-                return None
-            
-            time.sleep(0.3)
-        
-        return round(total_distance, 1)
-    
-    # Convert to [lon, lat] format
-    coordinates = [[coord[1], coord[0]] for coord in coordinates_list]
-    
-    url = "https://api.openrouteservice.org/v2/directions/driving-car/geojson"
-    headers = {"Authorization": ORS_API_KEY}
-    body = {"coordinates": coordinates}
-    
-    try:
-        r = requests.post(url, json=body, headers=headers, timeout=60)
-        
-        if r.status_code != 200:
-            print(f"⚠️ Route error: {r.status_code}, {r.text[:200]}")
-            return None
-        
-        data = r.json()
-        
-        if data.get("features") and data["features"][0].get("properties", {}).get("summary"):
-            dist = data["features"][0]["properties"]["summary"]["distance"]
-            return round(dist / 1000, 1)
-            
-    except requests.exceptions.Timeout:
-        print("⚠️ Route calculation timeout")
-    except Exception as e:
-        print(f"⚠️ Route calculation error: {e}")
-    
-    return None
-
-def calculate_route_safely(coordinates):
-    """Safe route calculation with validation"""
-    try:
-        valid_coords = []
-        for coord in coordinates:
-            if coord and isinstance(coord, tuple) and len(coord) == 2:
-                lat, lon = coord
-                if 40 <= lat <= 82 and 19 <= lon <= 190:
-                    valid_coords.append(coord)
-        
-        if len(valid_coords) < 2:
-            print(f"⚠️ Not enough valid coordinates: {len(valid_coords)}")
-            return None
-        
-        distance = ors_route_with_waypoints(valid_coords)
-        return distance
-        
-    except Exception as e:
-        print(f"⚠️ Safe route calculation error: {e}")
-        return None
-
-def variations(base):
-    """Generate distance variations"""
-    if base is None or base <= 0:
-        return [None, None]
-    
-    try:
-        variation = random.uniform(0.95, 1.05)
-        d2 = round(base * variation, 1)
-        
-        variation2 = random.uniform(0.92, 1.08)
-        d3 = round(base * variation2, 1)
-        
-        return [d2, d3]
-    except:
-        return [None, None]
-
-# ================== EXCEL HANDLING ==================
 def read_from_excel(path):
-    """Read routes from Excel file"""
+    """Чтение маршрутов из Excel файла с двумя колонками: стартовая точка и цепочка адресов"""
     wb = load_workbook(path, data_only=True)
     ws = wb.active
     routes = []
     
+    # Определяем максимальную строку
     max_row = ws.max_row
     
-    for row in range(2, max_row + 1):
-        start_point = ws.cell(row=row, column=1).value
-        address_chain = ws.cell(row=row, column=2).value
+    # Читаем данные, пропуская заголовки если они есть
+    for row in range(1, max_row + 1):
+        start_point = ws.cell(row=row, column=1).value  # Колонка A
+        address_chain = ws.cell(row=row, column=2).value  # Колонка B
         
+        # Проверяем, что есть оба значения
         if start_point and address_chain:
             routes.append({
                 'row_num': row,
                 'start_point': str(start_point).strip(),
                 'address_chain': str(address_chain).strip(),
+                'original_start': start_point,
+                'original_chain': address_chain
             })
     
     return routes, wb, ws
 
+def parse_address_chain(address_string):
+    """Парсит цепочку адресов, разделенных дефисами"""
+    if not address_string:
+        return []
+    
+    # Заменяем различные тире на обычный дефис
+    address_string = address_string.replace('–', '-').replace('—', '-')
+    
+    # Разделяем по дефису и очищаем
+    addresses = [addr.strip() for addr in address_string.split('-') if addr.strip()]
+    return addresses
+
+def yandex_geocode(address):
+    """Геокодирование адреса через Яндекс API"""
+    if not YANDEX_API_KEY:
+        print("⚠️ YANDEX_API_KEY не установлен!")
+        return None
+    
+    url = "https://geocode-maps.yandex.ru/1.x/"
+    params = {
+        "apikey": YANDEX_API_KEY,
+        "format": "json",
+        "geocode": address,
+        "results": 1
+    }
+    
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code != 200:
+            print(f"⚠️ Ошибка геокодирования: {r.status_code} для адреса: {address}")
+            return None
+        
+        data = r.json()
+        if (data["response"]["GeoObjectCollection"]["featureMember"] and 
+            len(data["response"]["GeoObjectCollection"]["featureMember"]) > 0):
+            pos = data["response"]["GeoObjectCollection"]["featureMember"][0]["GeoObject"]["Point"]["pos"]
+            lon, lat = pos.split()
+            return float(lat), float(lon)
+        else:
+            print(f"⚠️ Адрес не найден: {address}")
+            return None
+    except Exception as e:
+        print(f"⚠️ Ошибка при геокодировании {address}: {e}")
+        return None
+
+def ors_route_with_waypoints(coordinates_list):
+    """Строит маршрут через промежуточные точки"""
+    if not ORS_API_KEY:
+        print("⚠️ ORS_API_KEY не установлен!")
+        return None
+    
+    if len(coordinates_list) < 2:
+        return None
+    
+    url = "https://api.openrouteservice.org/v2/directions/driving-car/geojson"
+    headers = {"Authorization": ORS_API_KEY}
+    
+    # Преобразуем координаты в формат [lon, lat]
+    coordinates = [[coord[1], coord[0]] for coord in coordinates_list]
+    
+    body = {"coordinates": coordinates}
+    
+    try:
+        r = requests.post(url, json=body, headers=headers, timeout=30)
+        if r.status_code != 200:
+            print(f"⚠️ Ошибка маршрута: {r.status_code}")
+            return None
+        
+        data = r.json()
+        if data["features"] and data["features"][0]["properties"]["summary"]:
+            dist = data["features"][0]["properties"]["summary"]["distance"]
+            return round(dist / 1000, 1)
+        else:
+            return None
+    except Exception as e:
+        print(f"⚠️ Ошибка при построении маршрута: {e}")
+        return None
+
+def variations(base):
+    """Генерирует варианты расстояний"""
+    if base is None:
+        return [None, None]
+    
+    return [
+        round(base + random.uniform(5, 20), 1),
+        round(max(0, base - random.uniform(5, 20)), 1)
+    ]
+
 def add_result_columns(ws, start_col=3):
-    """Add result columns to Excel"""
+    """Добавляет колонки для результатов в Excel"""
     headers = [
         "Статус обработки",
         "Координаты старта",
         "Координаты точек",
-        "Кол-во точек",
+        "Количество точек",
         "Тип маршрута",
         "Расстояние 1 (км)",
         "Расстояние 2 (км)",
-        "Расстояние 3 (км)",
-        "Примечания"
+        "Расстояние 3 (км)"
     ]
     
-    header_font = Font(bold=True, color="FFFFFF", size=11)
-    header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-    thin_border = Border(
-        left=Side(style='thin'),
-        right=Side(style='thin'),
-        top=Side(style='thin'),
-        bottom=Side(style='thin')
-    )
-    
+    # Добавляем заголовки
     for i, header in enumerate(headers):
         cell = ws.cell(row=1, column=start_col + i)
         cell.value = header
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = thin_border
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill(start_color="FFE4B5", end_color="FFE4B5", fill_type="solid")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
     
-    column_widths = {
-        start_col: 20,
-        start_col + 1: 25,
-        start_col + 2: 40,
-        start_col + 3: 12,
-        start_col + 4: 20,
-        start_col + 5: 15,
-        start_col + 6: 15,
-        start_col + 7: 15,
-        start_col + 8: 30,
-    }
-    
-    for col, width in column_widths.items():
-        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
+    # Автоматически настраиваем ширину колонок
+    for column in ws.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            if cell.value:
+                max_length = max(max_length, len(str(cell.value)))
+        adjusted_width = min(max_length + 2, 50)
+        ws.column_dimensions[column_letter].width = adjusted_width
     
     return start_col + len(headers)
 
-# ================== TELEGRAM BOT WITH BUTTONS ==================
+# ================== TELEGRAM БОТ ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command with inline keyboard"""
-    keyboard = [
-        [
-            InlineKeyboardButton("📊 Обработать файл", callback_data="process_file"),
-            InlineKeyboardButton("📋 Инструкция", callback_data="help")
-        ],
-        [
-            InlineKeyboardButton("📊 Статистика", callback_data="stats"),
-            InlineKeyboardButton("🔄 Очистить кэш", callback_data="clear_cache")
-        ],
-        [
-            InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
-            InlineKeyboardButton("ℹ️ О боте", callback_data="about")
-        ]
-    ]
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
+    """Обработчик команды /start"""
     await update.message.reply_text(
-        "👋 *Добро пожаловать в бот для расчета маршрутов!*\n\n"
-        "Я помогу вам рассчитать расстояния между адресами с поддержкой промежуточных точек.\n\n"
-        "📁 *Формат Excel файла:*\n"
-        "• Колонка A: Стартовая точка\n"
+        "👋 Привет!\n\n"
+        "📌 Я бот для расчета маршрутов с поддержкой промежуточных точек.\n\n"
+        "📁 Отправьте мне Excel файл в формате:\n"
+        "• Колонка A: Стартовая точка (точка А)\n"
         "• Колонка B: Цепочка адресов через дефис\n\n"
-        "📤 *Просто отправьте мне Excel файл, и я верну результат!*",
-        parse_mode='Markdown',
-        reply_markup=reply_markup
+        "📊 Пример строки в колонке B:\n"
+        "`г. Воронеж, ул. Ипподромная 18А - г. Сергиев Посад, ул. Кирова 89`\n\n"
+        "✅ Я верну тот же файл с добавленными колонками результатов!"
     )
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline keyboard button presses"""
-    global GEOCODE_CACHE  # Добавлено
-    
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "process_file":
-        await query.edit_message_text(
-            "📤 *Отправьте Excel файл для обработки*\n\n"
-            "Формат файла:\n"
-            "• Колонка A: Стартовая точка\n"
-            "• Колонка B: Адреса через дефис\n\n"
-            "Пример: `г. Москва, ул. Ленина 1 - г. Санкт-Петербург, Невский пр. 2`",
-            parse_mode='Markdown'
-        )
-    
-    elif query.data == "help":
-        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            "📋 *Инструкция по использованию*\n\n"
-            "1. Подготовьте Excel файл с двумя колонками:\n"
-            "   • A: Стартовый адрес\n"
-            "   • B: Цепочка адресов через дефис\n\n"
-            "2. Отправьте файл боту\n"
-            "3. Дождитесь обработки\n"
-            "4. Получите файл с результатами\n\n"
-            "📊 *В результатах будут:*\n"
-            "• Статус обработки\n• Координаты\n• Расстояния\n• Примечания\n\n"
-            "⚡ *Особенности:*\n"
-            "• Поддержка промежуточных точек\n• Автокоррекция адресов\n• Кэширование геоданных",
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-    
-    elif query.data == "stats":
-        cache_size = len(GEOCODE_CACHE)
-        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            f"📊 *Статистика бота*\n\n"
-            f"• Кэшированных адресов: `{cache_size}`\n"
-            f"• Яндекс API: {'✅ Настроен' if YANDEX_API_KEY else '❌ Не настроен'}\n"
-            f"• ORS API: {'✅ Настроен' if ORS_API_KEY else '❌ Не настроен'}\n"
-            f"• Макс. точек: `{MAX_WAYPOINTS}`\n"
-            f"• Время: `{datetime.now().strftime('%H:%M:%S')}`",
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-    
-    elif query.data == "clear_cache":
-        old_size = len(GEOCODE_CACHE)
-        GEOCODE_CACHE.clear()
-        
-        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            f"✅ *Кэш очищен*\n\n"
-            f"Удалено записей: `{old_size}`\n"
-            f"Новый размер: `{len(GEOCODE_CACHE)}`",
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-    
-    elif query.data == "settings":
-        keyboard = [
-            [
-                InlineKeyboardButton("📊 Макс. точек", callback_data="set_max_points"),
-                InlineKeyboardButton("⚡ Скорость", callback_data="set_speed")
-            ],
-            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            "⚙️ *Настройки бота*\n\n"
-            "• Макс. точек в маршруте: `25`\n"
-            "• Задержка между запросами: `0.3с`\n"
-            "• Повторы при ошибках: `3`\n\n"
-            "Для изменения настроек свяжитесь с администратором.",
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-    
-    elif query.data == "about":
-        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            "ℹ️ *О боте*\n\n"
-            "🤖 *Бот для расчета маршрутов*\n"
-            "Версия: 2.0 (улучшенная)\n\n"
-            "📡 *Используемые API:*\n"
-            "• Яндекс.Карты для геокодирования\n"
-            "• OpenRouteService для расчета маршрутов\n\n"
-            "⚡ *Возможности:*\n"
-            "• Расчет маршрутов с промежуточными точками\n"
-            "• Автокоррекция и нормализация адресов\n"
-            "• Кэширование для ускорения обработки\n"
-            "• Подробная статистика и логирование\n\n"
-            "👨‍💻 *Разработчик:* @your_username",
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-    
-    elif query.data == "back_to_main":
-        keyboard = [
-            [
-                InlineKeyboardButton("📊 Обработать файл", callback_data="process_file"),
-                InlineKeyboardButton("📋 Инструкция", callback_data="help")
-            ],
-            [
-                InlineKeyboardButton("📊 Статистика", callback_data="stats"),
-                InlineKeyboardButton("🔄 Очистить кэш", callback_data="clear_cache")
-            ],
-            [
-                InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
-                InlineKeyboardButton("ℹ️ О боте", callback_data="about")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            "👋 *Главное меню*\n\n"
-            "Выберите действие:",
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle uploaded documents"""
-    global GEOCODE_CACHE  # Добавлено
-    
+    """Обработчик загруженных документов"""
     if not update.message.document:
         await update.message.reply_text("❌ Пожалуйста, отправьте файл")
         return
     
     file_name = update.message.document.file_name.lower()
-    if not (file_name.endswith('.xlsx') or file_name.endswith('.xls')):
-        await update.message.reply_text("❌ Пожалуйста, отправьте файл в формате Excel (XLSX/XLS)")
-        return
+    allowed_extensions = ['.xlsx', '.xls']
     
-    # Send processing started message
-    status_msg = await update.message.reply_text(
-        "⏳ *Начинаю обработку файла...*\n"
-        "Подготовка к работе...",
-        parse_mode='Markdown'
-    )
+    if not any(file_name.endswith(ext) for ext in allowed_extensions):
+        await update.message.reply_text(
+            "❌ Пожалуйста, отправьте файл в формате Excel (XLSX/XLS)"
+        )
+        return
     
     file = await update.message.document.get_file()
     user_id = update.message.from_user.id
+    
+    # Создаем уникальное имя файла
     timestamp = int(time.time())
     input_file = f"input_{user_id}_{timestamp}.xlsx"
     
     await file.download_to_drive(input_file)
     
     try:
+        # Читаем данные из Excel
         routes, wb, ws = read_from_excel(input_file)
     except Exception as e:
-        await status_msg.edit_text(f"❌ *Ошибка чтения файла:*\n`{str(e)[:200]}`", parse_mode='Markdown')
+        await update.message.reply_text(f"❌ Ошибка чтения файла: {e}")
         if os.path.exists(input_file):
             os.remove(input_file)
         return
@@ -538,25 +298,26 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = len(routes)
     
     if total == 0:
-        await status_msg.edit_text(
-            "❌ *В файле нет данных или неправильный формат.*\n"
-            "Проверьте, что в колонке A - стартовые точки, в колонке B - цепочки адресов.",
-            parse_mode='Markdown'
+        await update.message.reply_text(
+            "❌ В файле нет данных или неправильный формат.\n"
+            "Проверьте, что в колонке A - стартовые точки, в колонке B - цепочки адресов."
         )
         if os.path.exists(input_file):
             os.remove(input_file)
         return
     
-    # Add result columns
+    progress_msg = await update.message.reply_text(
+        f"⏳ Начинаю обработку\nВсего строк: {total}\nОбработка..."
+    )
+    
+    # Добавляем колонки для результатов
     start_col = add_result_columns(ws, start_col=3)
     
-    # Reset cache for new user
-    GEOCODE_CACHE.clear()
+    # Кэш для геокодированных адресов
+    geocode_cache = {}
     
     processed = 0
-    successful = 0
-    geocode_errors = 0
-    route_errors = 0
+    errors = 0
     
     for route in routes:
         try:
@@ -564,241 +325,275 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             start_point = route['start_point']
             address_chain = route['address_chain']
             
-            # Parse addresses
+            # Геокодируем стартовую точку
+            if start_point in geocode_cache:
+                start_coords = geocode_cache[start_point]
+            else:
+                start_coords = yandex_geocode(start_point)
+                time.sleep(0.5)  # Задержка между запросами
+                if start_coords:
+                    geocode_cache[start_point] = start_coords
+            
+            # Парсим цепочку адресов
             addresses = parse_address_chain(address_chain)
             
-            # Geocode start point
-            start_coords = yandex_geocode(normalize_address(start_point))
-            
-            if not start_coords:
-                geocode_errors += 1
-                ws.cell(row=row_num, column=3).value = "❌ Ошибка геокодирования"
-                ws.cell(row=row_num, column=11).value = "Не удалось определить координаты стартовой точки"
-                continue
-            
-            # Geocode all addresses in chain
+            # Геокодируем все адреса в цепочке
             all_coords = []
             all_coords_str = []
-            failed_addresses = []
+            geocode_errors = False
             
-            for i, addr in enumerate(addresses):
-                coords = yandex_geocode(addr)
+            for addr in addresses:
+                if addr in geocode_cache:
+                    coords = geocode_cache[addr]
+                else:
+                    coords = yandex_geocode(addr)
+                    time.sleep(0.5)  # Задержка между запросами
+                    if coords:
+                        geocode_cache[addr] = coords
+                
                 if coords:
                     all_coords.append(coords)
                     all_coords_str.append(f"{coords[0]:.6f},{coords[1]:.6f}")
                 else:
-                    failed_addresses.append(f"Адрес {i+1}")
-                    all_coords.append(None)
+                    geocode_errors = True
+                    break
             
-            # Check for geocoding errors
-            if failed_addresses:
-                geocode_errors += 1
-                ws.cell(row=row_num, column=3).value = "⚠️ Частичная ошибка геокодирования"
-                ws.cell(row=row_num, column=4).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
-                ws.cell(row=row_num, column=5).value = "; ".join([c for c in all_coords_str if c])
+            # Определяем тип маршрута
+            route_type = "С промежуточными точками" if len(addresses) > 1 else "Прямой"
+            
+            if geocode_errors or not start_coords or not all_coords:
+                # Записываем ошибку
+                ws.cell(row=row_num, column=3).value = "❌ Ошибка геокодирования"
+                ws.cell(row=row_num, column=4).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}" if start_coords else "Ошибка"
+                ws.cell(row=row_num, column=5).value = "; ".join(all_coords_str) if all_coords_str else "Ошибка"
                 ws.cell(row=row_num, column=6).value = len(addresses)
-                ws.cell(row=row_num, column=7).value = "С промежуточными точками" if len(addresses) > 1 else "Прямой"
+                ws.cell(row=row_num, column=7).value = route_type
                 ws.cell(row=row_num, column=8).value = "Ошибка"
-                ws.cell(row=row_num, column=11).value = f"Не удалось геокодировать: {', '.join(failed_addresses)}"
-                continue
-            
-            # Build full route
-            full_coordinates = [start_coords] + all_coords
-            
-            # Calculate route
-            distance = calculate_route_safely(full_coordinates)
-            
-            if distance:
-                d2, d3 = variations(distance)
-                successful += 1
-                
-                ws.cell(row=row_num, column=3).value = "✅ Успешно"
-                ws.cell(row=row_num, column=4).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
-                ws.cell(row=row_num, column=5).value = "; ".join(all_coords_str)
-                ws.cell(row=row_num, column=6).value = len(addresses)
-                ws.cell(row=row_num, column=7).value = "С промежуточными точками" if len(addresses) > 1 else "Прямой"
-                ws.cell(row=row_num, column=8).value = distance
-                ws.cell(row=row_num, column=9).value = d2
-                ws.cell(row=row_num, column=10).value = d3
-                ws.cell(row=row_num, column=11).value = ""
-                
-                # Format cells
-                for col in [8, 9, 10]:
-                    cell = ws.cell(row=row_num, column=col)
-                    cell.number_format = '0.0'
-                    if col == 8:
-                        cell.font = Font(bold=True)
+                ws.cell(row=row_num, column=9).value = ""
+                ws.cell(row=row_num, column=10).value = ""
+                errors += 1
             else:
-                route_errors += 1
-                ws.cell(row=row_num, column=3).value = "⚠️ Ошибка расчета маршрута"
-                ws.cell(row=row_num, column=4).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
-                ws.cell(row=row_num, column=5).value = "; ".join(all_coords_str)
-                ws.cell(row=row_num, column=6).value = len(addresses)
-                ws.cell(row=row_num, column=7).value = "С промежуточными точками" if len(addresses) > 1 else "Прямой"
-                ws.cell(row=row_num, column=8).value = "Ошибка"
-                ws.cell(row=row_num, column=11).value = "Не удалось построить маршрут"
+                # Строим маршрут: стартовая точка + все точки из цепочки
+                full_coordinates = [start_coords] + all_coords
+                
+                # Рассчитываем маршрут
+                distance = ors_route_with_waypoints(full_coordinates)
+                time.sleep(1)  # Задержка между запросами к ORS
+                
+                if distance:
+                    d2, d3 = variations(distance)
+                    
+                    # Записываем результаты
+                    ws.cell(row=row_num, column=3).value = "✅ Успешно"
+                    ws.cell(row=row_num, column=4).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
+                    ws.cell(row=row_num, column=5).value = "; ".join(all_coords_str)
+                    ws.cell(row=row_num, column=6).value = len(addresses)
+                    ws.cell(row=row_num, column=7).value = route_type
+                    ws.cell(row=row_num, column=8).value = distance
+                    ws.cell(row=row_num, column=9).value = d2
+                    ws.cell(row=row_num, column=10).value = d3
+                    
+                    # Форматируем ячейки с расстояниями
+                    for col in [8, 9, 10]:
+                        cell = ws.cell(row=row_num, column=col)
+                        cell.number_format = '0.0'
+                else:
+                    ws.cell(row=row_num, column=3).value = "⚠️ Ошибка расчета маршрута"
+                    ws.cell(row=row_num, column=4).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
+                    ws.cell(row=row_num, column=5).value = "; ".join(all_coords_str)
+                    ws.cell(row=row_num, column=6).value = len(addresses)
+                    ws.cell(row=row_num, column=7).value = route_type
+                    ws.cell(row=row_num, column=8).value = "Ошибка"
+                    ws.cell(row=row_num, column=9).value = ""
+                    ws.cell(row=row_num, column=10).value = ""
+                    errors += 1
             
             processed += 1
             
-            # Update progress every 10 rows
-            if processed % 10 == 0 or processed == total:
-                progress = int((processed / total) * 100)
-                await status_msg.edit_text(
-                    f"⏳ *Обработка: {processed}/{total}* ({progress}%)\n"
-                    f"✅ Успешно: `{successful}`\n"
-                    f"⚠️ Ошибки геокодирования: `{geocode_errors}`\n"
-                    f"⚠️ Ошибки маршрутов: `{route_errors}`",
-                    parse_mode='Markdown'
-                )
+            # Обновляем прогресс каждые 5 строк или в конце
+            if processed % 5 == 0 or processed == total:
+                try:
+                    status = f"✅ {processed - errors}" if processed - errors > 0 else ""
+                    error_status = f"❌ {errors}" if errors > 0 else ""
+                    
+                    await progress_msg.edit_text(
+                        f"⏳ Обработка: {processed} / {total}\n"
+                        f"{status} {error_status}\n"
+                        f"📍 Текущий: {start_point[:30]}..."
+                    )
+                except:
+                    pass
                 
         except Exception as e:
-            print(f"Error processing row {route.get('row_num', 'N/A')}: {e}")
-            processed += 1
+            print(f"Ошибка обработки строки {route.get('row_num', 'N/A')}: {e}")
+            errors += 1
     
-    # Format remaining rows
-    for row in range(2, ws.max_row + 1):
-        for col in range(3, 12):
-            cell = ws.cell(row=row, column=col)
-            if cell.value:
-                cell.border = Border(
-                    left=Side(style='thin'),
-                    right=Side(style='thin'),
-                    top=Side(style='thin'),
-                    bottom=Side(style='thin')
-                )
+    try:
+        await progress_msg.edit_text(
+            f"✅ Обработка завершена!\n"
+            f"Успешно: {processed - errors}\n"
+            f"Ошибок: {errors}\n"
+            f"Формирую отчет..."
+        )
+    except:
+        pass
     
-    # Save result
+    # Сохраняем результат
     output_file = f"results_{user_id}_{timestamp}.xlsx"
     wb.save(output_file)
     
-    # Send result
+    # Отправляем результат
     try:
         with open(output_file, "rb") as file:
             await update.message.reply_document(
                 document=file,
-                filename=f"результаты_{user_id}_улучшенный.xlsx",
-                caption=(
-                    f"✅ *Обработка завершена!*\n\n"
-                    f"📊 *Статистика:*\n"
-                    f"• Всего строк: `{total}`\n"
-                    f"• ✅ Успешно: `{successful}`\n"
-                    f"• ⚠️ Ошибки геокодирования: `{geocode_errors}`\n"
-                    f"• ⚠️ Ошибки маршрутов: `{route_errors}`\n"
-                    f"• 🕐 Время: `{datetime.now().strftime('%H:%M:%S')}`"
-                ),
-                parse_mode='Markdown'
+                filename=f"результаты_{user_id}.xlsx",
+                caption=f"✅ Готово!\nУспешно обработано: {processed - errors} строк\nОшибок: {errors}"
             )
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка отправки файла: {e}")
     
-    # Clean up
+    # Удаляем временные файлы
     try:
         if os.path.exists(input_file):
             os.remove(input_file)
         if os.path.exists(output_file):
             os.remove(output_file)
-    except:
-        pass
+    except Exception as e:
+        print(f"Ошибка удаления временных файлов: {e}")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Help command"""
-    await start(update, context)
+    """Обработчик команды /help"""
+    help_text = """
+📋 **Доступные команды:**
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Status command"""
-    global GEOCODE_CACHE  # Добавлено
-    
-    cache_size = len(GEOCODE_CACHE)
-    
-    keyboard = [[InlineKeyboardButton("🔄 Обновить", callback_data="stats")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
+/start - Начать работу с ботом
+/help - Показать эту справку
+
+📁 **Формат Excel файла:**
+• Колонка A: Стартовая точка (точка А)
+• Колонка B: Цепочка адресов через дефис
+
+📍 **Пример строки в колонке B:**
+`г. Воронеж, ул. Ипподромная 18А - г. Сергиев Посад, ул. Кирова 89`
+
+📊 **Добавляемые колонки результатов:**
+1. Статус обработки
+2. Координаты старта
+3. Координаты точек
+4. Количество точек
+5. Тип маршрута
+6. Расстояние 1 (км)
+7. Расстояние 2 (км)
+8. Расстояние 3 (км)
+
+**Типы маршрутов:**
+• Прямой - один адрес в цепочке
+• С промежуточными точками - несколько адресов через дефис
+"""
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def example_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /example - отправляет пример файла"""
     await update.message.reply_text(
-        f"📊 *Статус бота*\n\n"
-        f"• Время: `{datetime.now().strftime('%H:%M:%S')}`\n"
-        f"• Кэш адресов: `{cache_size}`\n"
-        f"• Яндекс API: {'✅' if YANDEX_API_KEY else '❌'}\n"
-        f"• ORS API: {'✅' if ORS_API_KEY else '❌'}\n"
-        f"• Версия: `2.0 (улучшенная)`",
-        parse_mode='Markdown',
-        reply_markup=reply_markup
+        "📋 Пример Excel файла:\n\n"
+        "| Колонка A | Колонка B |\n"
+        "|-----------|-----------|\n"
+        "| Ростов-на-Дону, Оганова 22 | г. Воронеж, ул. Ипподромная 18А |\n"
+        "| Ростов-на-Дону, Оганова 22 | г. Воронеж, ул. Ипподромная 18А - г. Сергиев Посад, ул. Кирова 89 |\n"
+        "| Ростов-на-Дону, Оганова 22 | р. Карелия, г. Петрозаводск, ул. Вольная 4 - г. Беломорск, ул. Мерецкова 6 |\n\n"
+        "Просто создайте Excel файл с такими данными и отправьте боту!"
     )
 
-# ================== MAIN ==================
-def run_flask():
-    """Run Flask server"""
-    port = int(os.environ.get('PORT', 10000))
-    print(f"🌐 Flask server running on port {port}")
-    
-    try:
-        from waitress import serve
-        serve(app, host='0.0.0.0', port=port, threads=4)
-    except ImportError:
-        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
-
+# ================== ЗАПУСК С ЗАЩИТОЙ ОТ КОНФЛИКТОВ ==================
 async def run_bot():
-    """Run Telegram bot"""
+    """Запускает бота с обработкой конфликтов"""
     print("=" * 50)
-    print("🚀 ЗАПУСК ТЕЛЕГРАМ БОТА (УЛУЧШЕННАЯ ВЕРСИЯ)")
+    print("🚀 ЗАПУСК ТЕЛЕГРАМ БОТА")
     print("=" * 50)
     
     if not BOT_TOKEN:
         print("❌ ОШИБКА: BOT_TOKEN не установлен!")
+        print("Установите переменную окружения BOT_TOKEN в Render")
         return
     
+    print(f"✅ Токен получен")
+    print(f"✅ Яндекс API: {'установлен' if YANDEX_API_KEY else 'не установлен'}")
+    print(f"✅ ORS API: {'установлен' if ORS_API_KEY else 'не установлен'}")
+    
+    # Создаем приложение
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     
-    # Add handlers
+    # Добавляем обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(CommandHandler("example", example_command))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
-    try:
-        await application.initialize()
-        await application.start()
-        
-        bot_info = await application.bot.get_me()
-        print(f"✅ Бот запущен: @{bot_info.username}")
-        
-        await application.updater.start_polling(
-            drop_pending_updates=True,
-            timeout=30,
-            poll_interval=0.5
-        )
-        
-        print("🤖 Бот работает и ожидает сообщений...")
-        
-        # Keep running
-        while True:
-            await asyncio.sleep(3600)
+    # Пытаемся запустить бота с обработкой конфликтов
+    max_retries = 5
+    retry_delay = 10  # секунд
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"🔄 Попытка {attempt + 1}/{max_retries} запустить бота...")
+            await application.initialize()
+            await application.start()
             
-    except Exception as e:
-        print(f"❌ Ошибка: {e}")
+            # Получаем информацию о боте
+            bot_info = await application.bot.get_me()
+            print(f"✅ Бот запущен: @{bot_info.username}")
+            
+            # Запускаем polling
+            await application.updater.start_polling(
+                drop_pending_updates=True,
+                timeout=30,
+                poll_interval=0.5
+            )
+            
+            print("🤖 Бот работает и ожидает сообщений...")
+            
+            # Бесконечный цикл (пока не будет остановлен)
+            while True:
+                await asyncio.sleep(3600)  # Спим час
+            
+        except Conflict as e:
+            print(f"⚠️ Конфликт: {e}")
+            print(f"⏳ Жду {retry_delay} секунд перед повторной попыткой...")
+            
+            # Останавливаем бота если он запущен
+            try:
+                await application.stop()
+                await application.shutdown()
+            except:
+                pass
+            
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # Экспоненциальная задержка
+            else:
+                print("❌ Достигнут лимит попыток. Бот не может запуститься.")
+                print("ℹ️ Проверьте, что нет других запущенных экземпляров бота.")
+                break
+                
+        except Exception as e:
+            print(f"❌ Ошибка: {e}")
+            break
 
 def main():
-    # Check if running on Render
+    # Проверяем, работаем ли на Render
     is_render = os.environ.get('RENDER') is not None
     port = os.environ.get('PORT')
     
     if is_render and port:
         print(f"🌐 Работаем на Render, порт: {port}")
-        
-        # Run bot in separate thread
-        bot_thread = threading.Thread(
-            target=lambda: asyncio.run(run_bot()),
-            daemon=True
-        )
-        bot_thread.start()
-        print("✅ Бот запущен в отдельном потоке")
-        
-        # Run Flask in main thread
-        run_flask()
-        
-    else:
-        print("🌐 Локальный запуск")
-        asyncio.run(run_bot())
+        # Запускаем Flask в отдельном потоке
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+        print("✅ Flask сервер запущен в отдельном потоке")
+    
+    # Запускаем бота
+    asyncio.run(run_bot())
 
 if __name__ == "__main__":
     main()
