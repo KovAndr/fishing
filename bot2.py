@@ -806,9 +806,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(stats_text)
 
-# ================== ЗАПУСК С ЗАЩИТОЙ ОТ КОНФЛИКТОВ ==================
+# ================== ЗАПУСК БОТА ==================
 async def run_bot():
-    """Запускает бота с обработкой конфликтов"""
+    """Запускает бота"""
     print("=" * 50)
     print("🚀 ЗАПУСК ТЕЛЕГРАМ БОТА")
     print("=" * 50)
@@ -835,50 +835,36 @@ async def run_bot():
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
-    # Настройки
-    application.drop_pending_updates = True
+    print("🤖 Бот запускается...")
     
+    # Запускаем бота с обработкой конфликтов
     max_retries = 5
     retry_delay = 10
     
     for attempt in range(max_retries):
         try:
             print(f"🔄 Попытка {attempt + 1}/{max_retries} запустить бота...")
-            await application.initialize()
-            await application.start()
             
             # Получаем информацию о боте
             bot_info = await application.bot.get_me()
             print(f"✅ Бот запущен: @{bot_info.username}")
-            
-            # Запускаем polling
-            await application.updater.start_polling(
-                poll_interval=0.5,
-                timeout=30,
-                bootstrap_retries=3
-            )
-            
             print("🤖 Бот работает и ожидает сообщений...")
             print("-" * 50)
             
-            # Бесконечный цикл
-            while True:
-                await asyncio.sleep(3600)
+            # Запускаем polling
+            await application.run_polling(
+                drop_pending_updates=True,
+                timeout=30,
+                poll_interval=0.5,
+                allowed_updates=Update.ALL_TYPES
+            )
             
         except Conflict as e:
             print(f"⚠️ Конфликт: {e}")
-            print(f"⏳ Жду {retry_delay} секунд перед повторной попыткой...")
-            
-            try:
-                if application.running:
-                    await application.stop()
-                    await application.shutdown()
-            except:
-                pass
-            
             if attempt < max_retries - 1:
+                print(f"⏳ Жду {retry_delay} секунд перед повторной попыткой...")
                 await asyncio.sleep(retry_delay)
-                retry_delay *= 2
+                retry_delay *= 2  # Экспоненциальная задержка
             else:
                 print("❌ Достигнут лимит попыток. Бот не может запуститься.")
                 print("ℹ️ Проверьте, что нет других запущенных экземпляров бота.")
