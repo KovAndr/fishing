@@ -793,5 +793,5 @@ def main():
         print("🌐 Локальный запуск")
         asyncio.run(run_bot())
 
-if __name__ == "__main__"
+if __name__ == "__main__":
 main()
