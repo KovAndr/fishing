@@ -121,6 +121,8 @@ def parse_address_chain(address_string):
 
 def yandex_geocode(address, max_retries=3):
     """Improved geocoding with better error handling"""
+    global GEOCODE_CACHE  # Добавлено
+    
     if not YANDEX_API_KEY:
         print("⚠️ YANDEX_API_KEY not set!")
         return None
@@ -367,6 +369,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline keyboard button presses"""
+    global GEOCODE_CACHE  # Добавлено
+    
     query = update.callback_query
     await query.answer()
     
@@ -417,7 +421,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     elif query.data == "clear_cache":
-        global GEOCODE_CACHE
         old_size = len(GEOCODE_CACHE)
         GEOCODE_CACHE.clear()
         
@@ -499,6 +502,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle uploaded documents"""
+    global GEOCODE_CACHE  # Добавлено
+    
     if not update.message.document:
         await update.message.reply_text("❌ Пожалуйста, отправьте файл")
         return
@@ -701,6 +706,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Status command"""
+    global GEOCODE_CACHE  # Добавлено
+    
     cache_size = len(GEOCODE_CACHE)
     
     keyboard = [[InlineKeyboardButton("🔄 Обновить", callback_data="stats")]]
