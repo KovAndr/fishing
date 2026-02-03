@@ -7,6 +7,8 @@ import threading
 import asyncio
 import re
 import json
+import signal
+import sys
 from math import radians, sin, cos, sqrt, atan2
 from docx import Document
 from telegram import Update
@@ -807,8 +809,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(stats_text)
 
 # ================== ЗАПУСК БОТА ==================
-async def run_bot():
-    """Запускает бота"""
+async def run_bot_async():
+    """Запускает бота асинхронно"""
     print("=" * 50)
     print("🚀 ЗАПУСК ТЕЛЕГРАМ БОТА")
     print("=" * 50)
@@ -837,63 +839,66 @@ async def run_bot():
     
     print("🤖 Бот запускается...")
     
-    # Запускаем бота с обработкой конфликтов
-    max_retries = 5
-    retry_delay = 10
+    try:
+        # Получаем информацию о боте
+        bot_info = await application.bot.get_me()
+        print(f"✅ Бот запущен: @{bot_info.username}")
+        print("🤖 Бот работает и ожидает сообщений...")
+        print("-" * 50)
+        
+        # Запускаем polling
+        await application.run_polling(
+            drop_pending_updates=True,
+            timeout=30,
+            poll_interval=0.5,
+            allowed_updates=Update.ALL_TYPES
+        )
+    except Conflict as e:
+        print(f"⚠️ Конфликт: {e}")
+        print("ℹ️ Проверьте, что нет других запущенных экземпляров бота.")
+    except Exception as e:
+        print(f"❌ Ошибка запуска бота: {e}")
+
+def run_bot():
+    """Запускает бота в отдельном потоке"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     
-    for attempt in range(max_retries):
-        try:
-            print(f"🔄 Попытка {attempt + 1}/{max_retries} запустить бота...")
-            
-            # Получаем информацию о боте
-            bot_info = await application.bot.get_me()
-            print(f"✅ Бот запущен: @{bot_info.username}")
-            print("🤖 Бот работает и ожидает сообщений...")
-            print("-" * 50)
-            
-            # Запускаем polling
-            await application.run_polling(
-                drop_pending_updates=True,
-                timeout=30,
-                poll_interval=0.5,
-                allowed_updates=Update.ALL_TYPES
-            )
-            
-        except Conflict as e:
-            print(f"⚠️ Конфликт: {e}")
-            if attempt < max_retries - 1:
-                print(f"⏳ Жду {retry_delay} секунд перед повторной попыткой...")
-                await asyncio.sleep(retry_delay)
-                retry_delay *= 2  # Экспоненциальная задержка
-            else:
-                print("❌ Достигнут лимит попыток. Бот не может запуститься.")
-                print("ℹ️ Проверьте, что нет других запущенных экземпляров бота.")
-                break
-                
-        except Exception as e:
-            print(f"❌ Ошибка запуска: {e}")
-            print("Проверьте токен бота и доступ к интернету.")
-            break
+    try:
+        loop.run_until_complete(run_bot_async())
+    except KeyboardInterrupt:
+        print("\n👋 Бот остановлен пользователем")
+    finally:
+        loop.close()
+
+def signal_handler(sig, frame):
+    """Обработчик сигналов для корректного завершения"""
+    print(f"\n⚠️ Получен сигнал {sig}. Завершаю работу...")
+    sys.exit(0)
 
 def main():
+    # Регистрируем обработчики сигналов
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     # Проверяем, работаем ли на Render
     is_render = os.environ.get('RENDER') is not None
     port = os.environ.get('PORT')
     
     if is_render and port:
         print(f"🌐 Работаем на Render, порт: {port}")
+        
         # Запускаем Flask в отдельном потоке
         flask_thread = threading.Thread(target=run_flask, daemon=True)
         flask_thread.start()
         print("✅ Flask сервер запущен в отдельном потоке")
-    
-    # Запускаем бота
-    try:
-        asyncio.run(run_bot())
-    except KeyboardInterrupt:
-        print("\n👋 Бот остановлен пользователем")
-    except Exception as e:
-        print(f"❌ Критическая ошибка: {e}")
+        
+        # Запускаем бота в основном потоке
+        run_bot()
+    else:
+        # Локальный запуск
+        print("🏠 Локальный запуск")
+        run_bot()
 
 if __name__ == "__main__":
     main()
