@@ -7,8 +7,8 @@ import threading
 import asyncio
 import re
 import tempfile
+import json
 from pathlib import Path
-from docx import Document
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -97,19 +97,119 @@ def run_flask():
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GRAPHHOPPER_API_KEY = os.getenv("GRAPHHOPPER_API_KEY", "2c8e643a-360f-47ab-855d-7e884ce217ad")
 
+# ================== КЭШИРОВАНИЕ И ЛОГИРОВАНИЕ ==================
+GEOCODE_CACHE_FILE = "geocode_cache.json"
+ERROR_LOG = "errors.log"
+
+def load_geocode_cache():
+    """Загружает кэш геокодирования из файла"""
+    if os.path.exists(GEOCODE_CACHE_FILE):
+        try:
+            with open(GEOCODE_CACHE_FILE, 'r', encoding='utf-8') as f:
+                cache = json.load(f)
+                print(f"📂 Загружен кэш геокодирования: {len(cache)} записей")
+                return cache
+        except Exception as e:
+            print(f"⚠️ Ошибка загрузки кэша: {e}")
+    return {}
+
+def save_geocode_cache(cache):
+    """Сохраняет кэш геокодирования в файл"""
+    try:
+        with open(GEOCODE_CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+        print(f"💾 Кэш сохранен: {len(cache)} записей")
+    except Exception as e:
+        print(f"⚠️ Ошибка сохранения кэша: {e}")
+
+def log_error(row_num, address, error_type, details=""):
+    """Логирует ошибки в файл"""
+    try:
+        with open(ERROR_LOG, 'a', encoding='utf-8') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | Row {row_num} | {error_type} | {address[:100]} | {details}\n")
+    except:
+        pass
+
 # ================== ФУНКЦИИ ОБРАБОТКИ АДРЕСОВ ==================
 def clean_text(text):
     """Очистка текста от лишних символов"""
     if not text:
         return ""
+    
+    # Приводим к строке
+    text = str(text)
+    
     # Заменяем различные типы тире на обычный дефис
-    text = str(text).replace('–', '-').replace('—', '-').replace('−', '-')
+    text = text.replace('–', '-').replace('—', '-').replace('−', '-').replace('–', '-')
+    
+    # Заменяем точки с запятыми после сокращений на запятые
+    text = re.sub(r'([а-яА-Я])\.\s*', r'\1, ', text)
+    
     # Убираем лишние пробелы
     text = ' '.join(text.split())
+    
     # Заменяем двойные дефисы на одинарные
     while '--' in text:
         text = text.replace('--', '-')
+    
+    # Убираем лишние запятые
+    while ',,' in text:
+        text = text.replace(',,', ',')
+    
     return text.strip()
+
+def normalize_region_name(region):
+    """Нормализует название региона"""
+    if not region:
+        return region
+    
+    region_lower = region.lower()
+    
+    replacements = {
+        "р. карелия": "Республика Карелия",
+        "р. коми": "Республика Коми",
+        "р. башкортостан": "Республика Башкортостан",
+        "р. адыгея": "Республика Адыгея",
+        "р. марий эл": "Республика Марий Эл",
+        "рсо-алания": "Республика Северная Осетия-Алания",
+        "кчр": "Карачаево-Черкесская Республика",
+        "кбр": "Кабардино-Балкарская Республика",
+        "р. крым": "Республика Крым",
+        "р. татарстан": "Республика Татарстан",
+        "р. дагестан": "Республика Дагестан",
+        "р. бурятия": "Республика Бурятия",
+        "р. мордовия": "Республика Мордовия",
+        "р. удмуртия": "Удмуртская Республика",
+        "р. хакасия": "Республика Хакасия",
+        "р. чувашия": "Чувашская Республика",
+        "р. саха": "Республика Саха (Якутия)",
+        "обл.": "область",
+        "край.": "край",
+        "респ.": "Республика",
+        "авт.": "автономный",
+        "ао": "автономный округ",
+        "р-н": "район",
+        "мо": "муниципальное образование",
+        "г.": "",
+        "с.": "",
+        "п.": "",
+        "ст.": "",
+        "х.": "",
+        "д.": "",
+        "рп": "рабочий поселок",
+        "пгт": "поселок городского типа",
+    }
+    
+    for old, new in replacements.items():
+        if old in region_lower:
+            region = region_lower.replace(old, new)
+    
+    # Капитализируем первую букву каждого слова
+    words = region.split()
+    words = [word.capitalize() for word in words if word]
+    region = ' '.join(words)
+    
+    return region
 
 def extract_region_from_address(address):
     """Извлекает регион (область, край, республику) из адреса"""
@@ -121,18 +221,17 @@ def extract_region_from_address(address):
     # Паттерны для регионов
     region_patterns = [
         r'^(.*?)\s+(?:обл\.|область|край|респ\.|республика|АО|авт\.\s+округ|р-н|район)',
-        r'^(р\.\s+[А-Яа-я]+)',  # р. Карелия, р. Коми
-        r'^(?:КЧР|КБР|РСО-Алания|р-н\s+[А-Яа-я]+)',  # Сокращенные названия
+        r'^(р\.\s+[А-Яа-яёЁ\s\-]+)',  # р. Карелия
+        r'^(?:КЧР|КБР|РСО[\-\s]?Алания|ЧР|УР|ХМАО|ЯНАО|Ненецкий\s+АО)',
+        r'^([А-Яа-яёЁ]+\s+[А-Яа-яёЁ]+(?:\s+[А-Яа-яёЁ]+)?)\s+(?:край|область|республика)',
     ]
     
     for pattern in region_patterns:
         match = re.search(pattern, address, re.IGNORECASE)
         if match:
             region = match.group(1).strip()
-            # Если регион начинается с "р.", убираем точку
-            if region.startswith('р.'):
-                region = region.replace('р.', 'Республика')
-            return region
+            if region:
+                return normalize_region_name(region)
     
     return None
 
@@ -143,17 +242,10 @@ def extract_settlement_from_address(address):
     
     address = clean_text(address)
     
-    # Удаляем регион из начала
-    region = extract_region_from_address(address)
-    if region:
-        # Удаляем регион и следующий за ним разделитель
-        pattern = re.escape(region) + r'[,\s\-]*'
-        address = re.sub(pattern, '', address, 1, re.IGNORECASE)
-    
     # Паттерны для населенных пунктов с разными типами
     settlement_patterns = [
         # г. Москва, г.Санкт-Петербург
-        r'(?:г\.|город\s+)([^,\-]+)',
+        r'(?:г\.|город\s+|г\s+)([^,\-]+)',
         # с. Ивановка, п. Горный
         r'(?:с\.|село\s+|п\.|посёлок\s+|пос\.|поселок\s+)([^,\-]+)',
         # ст-ца Каневская, ст.Ленинградская
@@ -163,24 +255,28 @@ def extract_settlement_from_address(address):
         # х. Согласный
         r'(?:х\.|хутор\s+)([^,\-]+)',
         # р.п. Мухтолово
-        r'(?:р\.п\.|рабочий посёлок\s+)([^,\-]+)',
+        r'(?:р\.п\.|рабочий\s+посёлок\s+)([^,\-]+)',
         # пгт. Черноморское
-        r'(?:пгт\.|посёлок городского типа\s+)([^,\-]+)',
+        r'(?:пгт\.|посёлок\s+городского\s+типа\s+)([^,\-]+)',
         # аул Кошехабль
         r'(?:аул\s+)([^,\-]+)',
         # Если есть запятая, берем первое слово до запятой
-        r'^([^,]+)(?=,)',
-        # Просто первое слово
-        r'^([^\s\-]+)'
+        r'^[^,]*?,\s*([^,\-]+)(?=,)',
+        # Берем первое слово после региона
+        r'^(?:[А-Яа-яёЁ]+\s+[А-Яа-яёЁ]+(?:\s+[А-Яа-яёЁ]+)?\s+(?:край|область|республика)[,\s]+)?([^,\-]+)',
     ]
     
     for pattern in settlement_patterns:
         match = re.search(pattern, address, re.IGNORECASE)
         if match:
             settlement = match.group(1).strip()
+            # Очищаем от кавычек и лишних символов
+            settlement = re.sub(r'["«»]', '', settlement)
             # Убираем возможные точки в конце
             if settlement.endswith('.'):
                 settlement = settlement[:-1]
+            # Убираем лишние пробелы
+            settlement = ' '.join(settlement.split())
             return settlement
     
     return None
@@ -192,8 +288,24 @@ def parse_address_chain(address_string, default_region=None):
     
     address_string = clean_text(address_string)
     
-    # Разделяем по дефису
-    addresses = [addr.strip() for addr in re.split(r'\s*-\s*', address_string) if addr.strip()]
+    # Разделяем по дефису, но учитываем, что в названиях могут быть дефисы
+    # Сначала заменяем дефисы в скобках на другой символ
+    temp_char = '§'
+    in_brackets = False
+    processed = []
+    for char in address_string:
+        if char == '(':
+            in_brackets = True
+        elif char == ')':
+            in_brackets = False
+        if char == '-' and in_brackets:
+            processed.append(temp_char)
+        else:
+            processed.append(char)
+    temp_string = ''.join(processed)
+    
+    # Разделяем по дефисам
+    addresses = [addr.replace(temp_char, '-').strip() for addr in re.split(r'\s*-\s*', temp_string) if addr.strip()]
     
     if not addresses:
         return []
@@ -211,7 +323,7 @@ def parse_address_chain(address_string, default_region=None):
         
         if not settlement:
             # Если не удалось извлечь населенный пункт, используем весь адрес
-            settlement = addr
+            settlement = addr.split(',')[0] if ',' in addr else addr
         
         # Если у текущего адреса нет региона, используем регион из первого адреса
         if not current_region and region_to_use and i > 0:
@@ -233,39 +345,62 @@ def simplify_address_for_geocoding(address):
     
     address = clean_text(address)
     
+    # Убираем сокращения "р." в начале
+    if address.lower().startswith('р. '):
+        address = address[2:].strip()
+    
+    # Убираем "ДНР", "ЛНР", "Херсонская обл.", "Запорожская обл." - GraphHopper их не найдет
+    address_lower = address.lower()
+    forbidden_phrases = ['днр', 'лнр', 'херсонская обл', 'запорожская обл', 'армия', 'воен']
+    
+    for phrase in forbidden_phrases:
+        if phrase in address_lower:
+            log_error(0, address, "FORBIDDEN_REGION", phrase)
+            return None
+    
     # Извлекаем регион и населенный пункт
     region = extract_region_from_address(address)
     settlement = extract_settlement_from_address(address)
     
     if not settlement:
-        # Если не удалось извлечь, возвращаем оригинальный адрес
-        return address
+        settlement = address.split(',')[0] if ',' in address else address
     
     # Формируем простой адрес для GraphHopper
-    # GraphHopper лучше работает с простыми названиями городов
-    if settlement:
-        # Для GraphHopper часто достаточно только названия города
-        simple_address = settlement
-        
-        # Добавляем "Russia" для лучшего геокодирования
-        if 'россия' not in simple_address.lower() and 'russia' not in simple_address.lower():
-            simple_address = f"{simple_address}, Russia"
-        
-        return simple_address
+    simple_address = settlement
     
-    return address
+    # Добавляем регион, если есть
+    if region:
+        simple_address = f"{settlement}, {region}"
+    
+    # Добавляем "Russia" для лучшего геокодирования
+    if 'россия' not in simple_address.lower() and 'russia' not in simple_address.lower():
+        simple_address = f"{simple_address}, Russia"
+    
+    return simple_address
 
 # ================== GRAPHHOPPER API ФУНКЦИИ ==================
-def graphhopper_geocode(address):
+def graphhopper_geocode(address, cache):
     """Геокодирование адреса через GraphHopper API"""
     if not GRAPHHOPPER_API_KEY:
         print("⚠️ GRAPHHOPPER_API_KEY не установлен!")
+        log_error(0, address, "NO_API_KEY")
         return None
     
     # Упрощаем адрес
     simplified_address = simplify_address_for_geocoding(address)
     
+    if not simplified_address:
+        print(f"❌ Адрес не может быть упрощен: {address}")
+        log_error(0, address, "CANNOT_SIMPLIFY")
+        return None
+    
     print(f"📍 GraphHopper геокодирует: {address[:50]}... -> {simplified_address}")
+    
+    # Проверяем кэш
+    cache_key = simplified_address
+    if cache_key in cache:
+        print(f"✅ Из кэша: {cache[cache_key]}")
+        return cache[cache_key]
     
     url = "https://graphhopper.com/api/1/geocode"
     params = {
@@ -281,7 +416,33 @@ def graphhopper_geocode(address):
         
         if r.status_code != 200:
             print(f"⚠️ Ошибка геокодирования {r.status_code} для: {simplified_address}")
-            print(f"⚠️ Ответ: {r.text[:200]}")
+            log_error(0, address, f"HTTP_{r.status_code}", r.text[:100])
+            
+            # Пробуем без "Russia"
+            if simplified_address.endswith(", Russia"):
+                simplified_address_ru = simplified_address[:-7].strip()
+                print(f"🔄 Пробую без 'Russia': {simplified_address_ru}")
+                
+                cache_key_ru = simplified_address_ru
+                if cache_key_ru in cache:
+                    return cache[cache_key_ru]
+                
+                params["q"] = simplified_address_ru
+                r = requests.get(url, params=params, timeout=30)
+                
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("hits") and len(data["hits"]) > 0:
+                        hit = data["hits"][0]
+                        location = hit.get("point", {})
+                        lat = location.get("lat")
+                        lng = location.get("lng")
+                        if lat is not None and lng is not None:
+                            coords = (float(lat), float(lng))
+                            print(f"✅ Найдены координаты (без Russia): {coords}")
+                            cache[cache_key_ru] = coords
+                            return coords
+            
             return None
         
         data = r.json()
@@ -297,33 +458,16 @@ def graphhopper_geocode(address):
             if lat is not None and lng is not None:
                 coords = (float(lat), float(lng))
                 print(f"✅ Найдены координаты: {coords} для '{hit.get('name', 'N/A')}'")
+                cache[cache_key] = coords
                 return coords
         
-        # Если не нашли, пробуем без "Russia"
-        if simplified_address.endswith(", Russia"):
-            simplified_address_ru = simplified_address[:-7].strip()
-            print(f"🔄 Пробую без 'Russia': {simplified_address_ru}")
-            params["q"] = simplified_address_ru
-            
-            r = requests.get(url, params=params, timeout=30)
-            
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("hits") and len(data["hits"]) > 0:
-                    hit = data["hits"][0]
-                    location = hit.get("point", {})
-                    lat = location.get("lat")
-                    lng = location.get("lng")
-                    if lat is not None and lng is not None:
-                        coords = (float(lat), float(lng))
-                        print(f"✅ Найдены координаты (без Russia): {coords}")
-                        return coords
-        
         print(f"⚠️ Адрес не найден: {simplified_address}")
+        log_error(0, address, "NOT_FOUND")
         return None
         
     except Exception as e:
         print(f"⚠️ Ошибка при геокодировании {address}: {e}")
+        log_error(0, address, "EXCEPTION", str(e))
         return None
 
 def graphhopper_route_with_waypoints(coordinates_list):
@@ -334,6 +478,12 @@ def graphhopper_route_with_waypoints(coordinates_list):
     
     if len(coordinates_list) < 2:
         return None
+    
+    # ⚠️ GraphHopper ограничение: максимум 4 точки
+    if len(coordinates_list) > 4:
+        print(f"⚠️ GraphHopper: слишком много точек ({len(coordinates_list)}). Максимум 4.")
+        print("⚠️ Буду использовать только первые 4 точки")
+        coordinates_list = coordinates_list[:4]
     
     url = "https://graphhopper.com/api/1/route"
     
@@ -365,10 +515,20 @@ def graphhopper_route_with_waypoints(coordinates_list):
         
         if r.status_code != 200:
             print(f"⚠️ Ошибка маршрута {r.status_code}")
-            # Попробуем получить детали ошибки
+            
+            # Если точек было 4 и ошибка 400, пробуем с 3 точками
+            if r.status_code == 400 and len(coordinates_list) == 4:
+                print("🔄 Пробую с 3 точками...")
+                return graphhopper_route_with_waypoints(coordinates_list[:3])
+            
+            # Пробуем получить детали ошибки
             try:
                 error_details = r.json()
                 print(f"⚠️ Детали ошибки: {error_details}")
+                if "Too many points" in str(error_details):
+                    print("🔄 Слишком много точек, пробую уменьшить...")
+                    if len(coordinates_list) > 2:
+                        return graphhopper_route_with_waypoints(coordinates_list[:len(coordinates_list)-1])
             except:
                 print(f"⚠️ Текст ошибки: {r.text[:200]}")
             return None
@@ -498,6 +658,29 @@ def variations(base):
     
     return [var1, var2]
 
+def validate_address_chain(address_chain):
+    """Проверяет корректность цепочки адресов"""
+    if not address_chain:
+        return False
+    
+    # Проверяем наличие дефисов для разделения адресов
+    if "-" not in address_chain:
+        # Но может быть прямой маршрут
+        return True
+    
+    # Проверяем, что адреса не содержат заведомо некорректных данных
+    invalid_phrases = [
+        "Ошибка", "ошибка", "error", "Error", 
+        "Не определено", "не определено",
+        "NULL", "null", "None", "none"
+    ]
+    
+    for phrase in invalid_phrases:
+        if phrase in address_chain:
+            return False
+    
+    return True
+
 # ================== TELEGRAM БОТ ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
@@ -512,7 +695,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ Я верну тот же файл с результатами расчетов!\n\n"
         "⚡ Используется GraphHopper API\n"
         "📍 Геокодируются только населенные пункты\n"
-        "🛣️ Расчет автомобильных маршрутов"
+        "🛣️ Расчет автомобильных маршрутов\n\n"
+        "⚠️ **Ограничения:**\n"
+        "• Максимум 4 точки в маршруте\n"
+        "• Крым, ДНР, ЛНР не поддерживаются\n"
+        "• Маленькие населенные пункты могут не найтись"
     )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -591,19 +778,26 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ Начинаю обработку...\n"
             f"📊 Всего строк: {total}\n"
             f"🔑 API: GraphHopper\n"
-            f"⏱️ Ориентировочное время: {total * 3} секунд"
+            f"⏱️ Ориентировочное время: {total * 5} секунд\n\n"
+            f"⚠️ **Внимание:**\n"
+            f"• Обрабатывается максимум 4 точки в маршруте\n"
+            f"• Крым, ДНР, ЛНР пропускаются\n"
+            f"• Паузы между запросами для API"
         )
+        
+        # Загружаем кэш геокодирования
+        geocode_cache = load_geocode_cache()
         
         # Добавляем колонки для результатов
         start_col = add_result_columns(ws, start_col=3)
         
         # Настройки для обработки
-        geocode_cache = {}
         processed = 0
         errors = 0
         geocode_errors = 0
         route_errors = 0
         successful = 0
+        skipped = 0
         
         # Обрабатываем каждую строку
         for route in routes:
@@ -617,35 +811,44 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 print(f"🏁 Старт: {start_point[:50]}...")
                 print(f"🛣️ Маршрут: {address_chain[:50]}...")
                 
-                # ===== ГЕОКОДИРОВАНИЕ СТАРТОВОЙ ТОЧКИ =====
-                start_simplified = simplify_address_for_geocoding(start_point)
-                cache_key_start = f"start_{start_simplified}"
+                # ===== ПРОВЕРКА ДАННЫХ =====
+                if not validate_address_chain(address_chain):
+                    print(f"❌ Некорректный формат адресов, пропускаю")
+                    skipped += 1
+                    
+                    ws.cell(row=row_num, column=start_col).value = "❌ Некорректный формат адресов"
+                    ws.cell(row=row_num, column=start_col+1).value = "Пропущено"
+                    ws.cell(row=row_num, column=start_col+2).value = "Пропущено"
+                    ws.cell(row=row_num, column=start_col+3).value = 0
+                    ws.cell(row=row_num, column=start_col+4).value = "Ошибка"
+                    ws.cell(row=row_num, column=start_col+5).value = "Пропущено"
+                    
+                    processed += 1
+                    continue
                 
-                if cache_key_start in geocode_cache:
-                    start_coords = geocode_cache[cache_key_start]
-                    print(f"✅ Старт из кэша: {start_coords}")
-                else:
-                    start_coords = graphhopper_geocode(start_point)
-                    time.sleep(0.3)  # Пауза между запросами
-                    if start_coords:
-                        geocode_cache[cache_key_start] = start_coords
-                    else:
-                        print(f"❌ Ошибка геокодирования старта: {start_point}")
-                        geocode_errors += 1
-                        errors += 1
-                        
-                        # Записываем ошибку
-                        ws.cell(row=row_num, column=start_col).value = "❌ Ошибка геокодирования старта"
-                        ws.cell(row=row_num, column=start_col+1).value = "Ошибка"
-                        ws.cell(row=row_num, column=start_col+2).value = "Ошибка"
-                        ws.cell(row=row_num, column=start_col+3).value = 0
-                        ws.cell(row=row_num, column=start_col+4).value = "Ошибка"
-                        ws.cell(row=row_num, column=start_col+5).value = "Ошибка"
-                        
-                        processed += 1
-                        continue
+                # ===== ГЕОКОДИРОВАНИЕ СТАРТОВОЙ ТОЧКИ =====
+                print(f"📍 Геокодирую стартовую точку...")
+                start_coords = graphhopper_geocode(start_point, geocode_cache)
+                time.sleep(0.5)  # Пауза для API
+                
+                if not start_coords:
+                    print(f"❌ Ошибка геокодирования старта: {start_point}")
+                    geocode_errors += 1
+                    errors += 1
+                    
+                    # Записываем ошибку
+                    ws.cell(row=row_num, column=start_col).value = "❌ Ошибка геокодирования старта"
+                    ws.cell(row=row_num, column=start_col+1).value = "Ошибка"
+                    ws.cell(row=row_num, column=start_col+2).value = "Ошибка"
+                    ws.cell(row=row_num, column=start_col+3).value = 0
+                    ws.cell(row=row_num, column=start_col+4).value = "Ошибка"
+                    ws.cell(row=row_num, column=start_col+5).value = "Ошибка"
+                    
+                    processed += 1
+                    continue
                 
                 # ===== ПАРСИНГ ЦЕПОЧКИ АДРЕСОВ =====
+                print(f"📍 Парсинг цепочки адресов...")
                 # Извлекаем регион из первого адреса цепочки
                 first_address_region = None
                 if address_chain and '-' in address_chain:
@@ -669,37 +872,38 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     continue
                 
                 # ===== ГЕОКОДИРОВАНИЕ ТОЧЕК МАРШРУТА =====
+                print(f"📍 Геокодирую точки маршрута ({len(addresses)} точек)...")
                 all_coords = []
                 all_coords_str = []
                 has_geocode_error = False
                 
                 for i, addr in enumerate(addresses):
-                    addr_simplified = simplify_address_for_geocoding(addr)
-                    cache_key_addr = f"addr_{addr_simplified}"
+                    print(f"  📍 Точка {i+1}/{len(addresses)}: {addr[:40]}...")
+                    coords = graphhopper_geocode(addr, geocode_cache)
+                    time.sleep(0.5)  # Пауза между запросами
                     
-                    if cache_key_addr in geocode_cache:
-                        coords = geocode_cache[cache_key_addr]
-                        print(f"✅ Точка {i+1} из кэша: {coords}")
+                    if coords:
+                        all_coords.append(coords)
+                        all_coords_str.append(f"{coords[0]:.6f},{coords[1]:.6f}")
+                        print(f"    ✅ Координаты: {coords}")
                     else:
-                        coords = graphhopper_geocode(addr)
-                        time.sleep(0.3)  # Пауза между запросами
-                        if coords:
-                            geocode_cache[cache_key_addr] = coords
-                        else:
-                            print(f"❌ Ошибка геокодирования точки {i+1}: {addr}")
-                            has_geocode_error = True
-                            geocode_errors += 1
-                            break
-                    
-                    all_coords.append(coords)
-                    all_coords_str.append(f"{coords[0]:.6f},{coords[1]:.6f}")
+                        print(f"    ❌ Ошибка геокодирования точки {i+1}: {addr}")
+                        has_geocode_error = True
+                        geocode_errors += 1
+                        break
                 
                 if has_geocode_error or not all_coords:
                     errors += 1
                     
-                    ws.cell(row=row_num, column=start_col).value = "❌ Ошибка геокодирования точек"
+                    status = "❌ Ошибка геокодирования точек"
+                    if not all_coords_str:
+                        coordinates_str = "Ошибка"
+                    else:
+                        coordinates_str = "; ".join(all_coords_str)
+                    
+                    ws.cell(row=row_num, column=start_col).value = status
                     ws.cell(row=row_num, column=start_col+1).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
-                    ws.cell(row=row_num, column=start_col+2).value = "Ошибка" if not all_coords_str else "; ".join(all_coords_str)
+                    ws.cell(row=row_num, column=start_col+2).value = coordinates_str
                     ws.cell(row=row_num, column=start_col+3).value = len(addresses)
                     ws.cell(row=row_num, column=start_col+4).value = "С промежуточными точками" if len(addresses) > 1 else "Прямой"
                     ws.cell(row=row_num, column=start_col+5).value = "Ошибка"
@@ -711,10 +915,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 route_type = "С промежуточными точками" if len(addresses) > 1 else "Прямой"
                 full_coordinates = [start_coords] + all_coords
                 
+                # Если точек больше 4, предупреждаем
+                if len(full_coordinates) > 4:
+                    print(f"⚠️ Внимание: {len(full_coordinates)} точек в маршруте (максимум 4)")
+                    route_type = f"{route_type} (ограничено 4 точками)"
+                
                 print(f"📍 Строю маршрут через {len(full_coordinates)} точек...")
                 
                 distance = graphhopper_route_with_waypoints(full_coordinates)
-                time.sleep(0.5)  # Пауза для API
+                time.sleep(1)  # Пауза для API
                 
                 if distance and distance > 0:
                     d2, d3 = variations(distance)
@@ -735,7 +944,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     route_errors += 1
                     errors += 1
                     
-                    ws.cell(row=row_num, column=start_col).value = "⚠️ Ошибка расчета маршрута"
+                    status = "⚠️ Ошибка расчета маршрута"
+                    if len(full_coordinates) > 4:
+                        status = "⚠️ Слишком много точек (>4)"
+                    
+                    ws.cell(row=row_num, column=start_col).value = status
                     ws.cell(row=row_num, column=start_col+1).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
                     ws.cell(row=row_num, column=start_col+2).value = "; ".join(all_coords_str)
                     ws.cell(row=row_num, column=start_col+3).value = len(addresses)
@@ -755,6 +968,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             f"⏳ Обработка: {processed}/{total} ({progress_percent}%)\n"
                             f"✅ Успешно: {successful}\n"
                             f"❌ Ошибки: {errors}\n"
+                            f"⏭️ Пропущено: {skipped}\n"
                         )
                         
                         if geocode_errors > 0:
@@ -763,9 +977,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if route_errors > 0:
                             progress_text += f"🛣️ Маршруты: {route_errors}\n"
                         
-                        settlement = extract_settlement_from_address(start_point)
-                        if settlement:
-                            progress_text += f"📍 Текущий: {settlement[:30]}..."
+                        # Показываем текущий обрабатываемый город
+                        if processed < total and successful > 0:
+                            settlement = extract_settlement_from_address(start_point)
+                            if settlement:
+                                progress_text += f"📍 Текущий: {settlement[:30]}..."
                         
                         await progress_msg.edit_text(progress_text)
                     except Exception as e:
@@ -773,8 +989,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         
             except Exception as e:
                 print(f"❌ Критическая ошибка в строке {row_num}: {e}")
+                log_error(row_num, f"{start_point[:50]}...", "CRITICAL", str(e))
                 errors += 1
                 processed += 1
+        
+        # ===== СОХРАНЕНИЕ КЭША =====
+        save_geocode_cache(geocode_cache)
         
         # ===== СОХРАНЕНИЕ И ОТПРАВКА РЕЗУЛЬТАТА =====
         try:
@@ -784,6 +1004,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• Всего строк: {total}\n"
                 f"• Успешно: {successful}\n"
                 f"• Ошибок: {errors}\n"
+                f"• Пропущено: {skipped}\n"
                 f"  └ Геокодирование: {geocode_errors}\n"
                 f"  └ Расчет маршрутов: {route_errors}\n\n"
                 f"💾 Сохраняю результаты..."
@@ -803,11 +1024,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"📊 **Статистика:**\n"
                     f"• Всего строк: {total}\n"
                     f"• Успешно: {successful}\n"
-                    f"• Ошибок: {errors}\n\n"
+                    f"• Ошибок: {errors}\n"
+                    f"• Пропущено: {skipped}\n\n"
                     f"⚡ **Использовано:**\n"
                     f"• GraphHopper API\n"
                     f"• Геокодирование по населенным пунктам\n"
                     f"• Расчет автомобильных маршрутов\n\n"
+                    f"⚠️ **Ограничения:**\n"
+                    f"• Максимум 4 точки в маршруте\n"
+                    f"• Крым, ДНР, ЛНР не поддерживаются\n\n"
                     f"📎 Файл: {file_name}"
                 )
                 
@@ -873,15 +1098,35 @@ B1: Ярославская обл., г. Ростов Великий - г. Яро
 • Геокодируются только города/населенные пункты
 • Улицы и номера домов игнорируются
 • Автоматическое применение регионов
+
+⚠️ **Ограничения:**
+• Максимум 4 точки в маршруте (ограничение GraphHopper)
+• Крым, ДНР, ЛНР, Херсонская, Запорожская области не поддерживаются
+• Маленькие населенные пункты могут не найтись
+• Паузы между запросами для соблюдения лимитов API
 """
     await update.message.reply_text(help_text)
 
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Тестовая команда для проверки работы бота"""
+    api_status = "✅ Доступен" if GRAPHHOPPER_API_KEY else "❌ Не настроен"
+    
+    # Проверяем кэш
+    cache_size = 0
+    if os.path.exists(GEOCODE_CACHE_FILE):
+        try:
+            with open(GEOCODE_CACHE_FILE, 'r', encoding='utf-8') as f:
+                cache = json.load(f)
+                cache_size = len(cache)
+        except:
+            pass
+    
     await update.message.reply_text(
-        "🤖 Бот работает!\n\n"
-        "Отправьте Excel файл для расчета маршрутов.\n\n"
-        "GraphHopper API: " + ("✅ Доступен" if GRAPHHOPPER_API_KEY else "❌ Не настроен")
+        f"🤖 Бот работает!\n\n"
+        f"Отправьте Excel файл для расчета маршрутов.\n\n"
+        f"GraphHopper API: {api_status}\n"
+        f"📂 Кэш геокодирования: {cache_size} записей\n"
+        f"📝 Лог ошибок: {'✅ Включен' if os.path.exists(ERROR_LOG) else '❌ Отключен'}"
     )
 
 # ================== ЗАПУСК БОТА ==================
