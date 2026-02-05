@@ -1,5 +1,4 @@
 import requests
-import pandas as pd
 import openpyxl
 import random
 import time
@@ -8,7 +7,6 @@ import threading
 import asyncio
 import re
 import tempfile
-import json
 from pathlib import Path
 from docx import Document
 from telegram import Update
@@ -24,8 +22,6 @@ from telegram.error import Conflict
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
-import warnings
-warnings.filterwarnings('ignore')
 
 # ================== ФЛАСК ДЛЯ RENDER ==================
 app = Flask(__name__)
@@ -400,31 +396,30 @@ def graphhopper_route_with_waypoints(coordinates_list):
 
 # ================== ЧТЕНИЕ И ЗАПИСЬ EXCEL ==================
 def read_excel_with_fallback(file_path):
-    """Читает Excel файл с несколькими попытками и разными методами"""
+    """Читает Excel файл с помощью openpyxl"""
     try:
-        # Сначала пробуем openpyxl
-        print(f"📖 Пытаюсь прочитать файл с openpyxl...")
-        wb = load_workbook(file_path, data_only=True, read_only=False)
+        print(f"📖 Чтение файла с openpyxl...")
+        wb = load_workbook(file_path, data_only=True)
         ws = wb.active
         
         # Собираем данные
         data = []
         max_row = ws.max_row
-        max_col = ws.max_column
         
-        # Определяем, есть ли заголовки
+        # Определяем, есть ли заголовки (проверяем первую строку)
         has_headers = False
         if max_row > 0:
-            # Проверяем первую строку на наличие текста
-            first_row = []
-            for col in range(1, min(max_col, 10) + 1):  # Проверяем первые 10 колонок
-                cell_value = ws.cell(row=1, column=col).value
-                first_row.append(str(cell_value) if cell_value else "")
+            # Проверяем первые 2 ячейки первой строки
+            cell1 = ws.cell(row=1, column=1).value
+            cell2 = ws.cell(row=1, column=2).value
             
-            # Если в первой строке есть слова "пункт", "назначение", "груз" и т.д., то это заголовки
-            header_keywords = ['пункт', 'назначение', 'груз', 'адрес', 'point', 'address', 'destination']
-            first_row_text = ' '.join(first_row).lower()
-            has_headers = any(keyword in first_row_text for keyword in header_keywords)
+            # Если в первой строке есть слова "пункт", "назначение" и т.д., то это заголовки
+            if cell1 and cell2:
+                text1 = str(cell1).lower()
+                text2 = str(cell2).lower()
+                header_keywords = ['пункт', 'назначение', 'груз', 'адрес', 'точка', 'отправ', 'получ']
+                has_headers = any(keyword in text1 for keyword in header_keywords) or \
+                             any(keyword in text2 for keyword in header_keywords)
         
         start_row = 2 if has_headers else 1
         
@@ -432,62 +427,27 @@ def read_excel_with_fallback(file_path):
             col1 = ws.cell(row=row, column=1).value
             col2 = ws.cell(row=row, column=2).value
             
-            if col1 and col2:
-                data.append({
-                    'row_num': row,
-                    'start_point': clean_text(str(col1)),
-                    'address_chain': clean_text(str(col2)),
-                    'original_start': col1,
-                    'original_chain': col2
-                })
+            # Проверяем, что обе ячейки не пустые
+            if col1 is not None and col2 is not None:
+                start_point = clean_text(str(col1))
+                address_chain = clean_text(str(col2))
+                
+                # Игнорируем строки, где слишком мало символов
+                if len(start_point) > 3 and len(address_chain) > 3:
+                    data.append({
+                        'row_num': row,
+                        'start_point': start_point,
+                        'address_chain': address_chain,
+                        'original_start': col1,
+                        'original_chain': col2
+                    })
         
-        print(f"✅ Успешно прочитано {len(data)} строк с openpyxl")
+        print(f"✅ Успешно прочитано {len(data)} строк")
         return data, wb, ws
         
-    except Exception as e1:
-        print(f"⚠️ Ошибка openpyxl: {e1}")
-        
-        try:
-            # Пробуем pandas как запасной вариант
-            print(f"📖 Пытаюсь прочитать файл с pandas...")
-            
-            # Определяем расширение файла
-            file_ext = os.path.splitext(file_path)[1].lower()
-            
-            if file_ext in ['.xls', '.xlsx', '.xlsm', '.xlsb']:
-                # Читаем с pandas
-                df = pd.read_excel(file_path, header=None, engine='openpyxl' if file_ext == '.xlsx' else None)
-            else:
-                # Пробуем все движки
-                df = pd.read_excel(file_path, header=None)
-            
-            # Создаем новый workbook с openpyxl
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            
-            # Копируем данные из DataFrame
-            for r_idx, row in df.iterrows():
-                for c_idx, value in enumerate(row):
-                    ws.cell(row=r_idx+1, column=c_idx+1, value=value)
-            
-            # Собираем данные
-            data = []
-            for idx, row in df.iterrows():
-                if pd.notna(row[0]) and pd.notna(row[1]):
-                    data.append({
-                        'row_num': idx + 1,
-                        'start_point': clean_text(str(row[0])),
-                        'address_chain': clean_text(str(row[1])),
-                        'original_start': row[0],
-                        'original_chain': row[1]
-                    })
-            
-            print(f"✅ Успешно прочитано {len(data)} строк с pandas")
-            return data, wb, ws
-            
-        except Exception as e2:
-            print(f"❌ Ошибка pandas: {e2}")
-            raise Exception(f"Не удалось прочитать файл. Убедитесь, что это корректный Excel файл. Ошибки: {e1}, {e2}")
+    except Exception as e:
+        print(f"❌ Ошибка чтения файла: {e}")
+        raise Exception(f"Не удалось прочитать файл. Убедитесь, что это корректный Excel файл (формат .xlsx). Ошибка: {str(e)[:200]}")
 
 def add_result_columns(ws, start_col=3):
     """Добавляет колонки для результатов в Excel"""
@@ -565,16 +525,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_name_lower = file_name.lower()
     
     # Проверяем расширение файла
-    allowed_extensions = ['.xlsx', '.xls', '.xlsm', '.xlsb', '.ods']
+    allowed_extensions = ['.xlsx', '.xls']
     
     if not any(file_name_lower.endswith(ext) for ext in allowed_extensions):
         await update.message.reply_text(
             "❌ Пожалуйста, отправьте файл в формате Excel:\n"
             "• .xlsx (рекомендуется)\n"
-            "• .xls\n"
-            "• .xlsm\n"
-            "• .xlsb\n"
-            "• .ods"
+            "• .xls\n\n"
+            "Если у вас файл другого формата, сохраните его как .xlsx в Excel."
         )
         return
     
@@ -604,7 +562,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             routes, wb, ws = read_excel_with_fallback(input_file)
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка чтения файла: {str(e)[:200]}\n\n"
-                                           "Убедитесь, что файл не поврежден и является корректным Excel файлом.")
+                                           "Убедитесь, что:\n"
+                                           "1. Файл не поврежден\n"
+                                           "2. Это корректный Excel файл (.xlsx)\n"
+                                           "3. Данные находятся на первом листе\n"
+                                           "4. В колонке A - стартовые точки, в B - цепочки адресов")
             if os.path.exists(input_file):
                 os.remove(input_file)
             return
@@ -617,7 +579,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Проверьте, что:\n"
                 "1. В колонке A есть стартовые точки\n"
                 "2. В колонке B есть цепочки адресов\n"
-                "3. Данные начинаются с первой строки (или со второй, если есть заголовки)"
+                "3. Данные начинаются с первой строки (или со второй, если есть заголовки)\n"
+                "4. Адреса в колонке B разделены дефисом (-)"
             )
             if os.path.exists(input_file):
                 os.remove(input_file)
@@ -873,7 +836,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         error_msg = str(e)[:500]
         await update.message.reply_text(f"❌ Критическая ошибка: {error_msg}\n\n"
                                        "Пожалуйста, попробуйте:\n"
-                                       "1. Сохранить файл как .xlsx\n"
+                                       "1. Сохранить файл как .xlsx в Excel\n"
                                        "2. Проверить, что файл не поврежден\n"
                                        "3. Отправить файл заново")
 
