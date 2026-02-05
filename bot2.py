@@ -1,9 +1,11 @@
 import requests
 import openpyxl
-import os
-import asyncio
-import threading
+import random
 import time
+import os
+import threading
+import asyncio
+from docx import Document
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -16,7 +18,6 @@ from flask import Flask
 from telegram.error import Conflict
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
-import json
 
 # ================== ФЛАСК ДЛЯ RENDER ==================
 app = Flask(__name__)
@@ -91,48 +92,52 @@ def run_flask():
 # ================== НАСТРОЙКИ БОТА ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "")
-# Используем бесплатный OSRM вместо ORS (не требует ключа)
-OSRM_BASE_URL = "http://router.project-osrm.org/route/v1/driving/"
+ORS_API_KEY = os.getenv("ORS_API_KEY", "")
 
-# ================== УЛУЧШЕННАЯ ЛОГИКА БОТА ==================
-def read_from_excel_new_format(path):
-    """Чтение Excel файла с двумя колонками: точка А и точка Б"""
+# ================== ЛОГИКА БОТА ==================
+def read_from_docx(path):
+    """Чтение адресов из DOCX файла"""
+    doc = Document(path)
+    lines = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    return [l for l in lines if len(l) > 10 and not l.replace(' ', '').isdigit()]
+
+def read_from_excel(path):
+    """Чтение маршрутов из Excel файла с двумя колонками: стартовая точка и цепочка адресов"""
     wb = load_workbook(path, data_only=True)
     ws = wb.active
     routes = []
     
-    # Начинаем с первой строки (в вашем файле есть заголовки)
-    # Пропускаем заголовки
-    for row in range(2, ws.max_row + 1):
-        point_a = ws.cell(row=row, column=1).value  # Колонка A
-        point_b = ws.cell(row=row, column=2).value  # Колонка B
+    # Определяем максимальную строку
+    max_row = ws.max_row
+    
+    # Читаем данные, пропуская заголовки если они есть
+    for row in range(1, max_row + 1):
+        start_point = ws.cell(row=row, column=1).value  # Колонка A
+        address_chain = ws.cell(row=row, column=2).value  # Колонка B
         
-        if point_a and point_b:
-            # Очищаем адреса
-            point_a_clean = str(point_a).strip()
-            point_b_clean = str(point_b).strip()
-            
-            # Проверяем, есть ли промежуточные точки через тире
-            if '-' in point_b_clean:
-                # Разбиваем на цепочку адресов
-                addresses = [addr.strip() for addr in point_b_clean.split('-') if addr.strip()]
-                # Первый адрес в цепочке - точка A, остальные - промежуточные
-                start_point = point_a_clean
-                chain_addresses = addresses
-            else:
-                # Простой маршрут А -> Б
-                start_point = point_a_clean
-                chain_addresses = [point_b_clean]
-            
+        # Проверяем, что есть оба значения
+        if start_point and address_chain:
             routes.append({
                 'row_num': row,
-                'start_point': start_point,
-                'chain_addresses': chain_addresses,
-                'original_a': point_a,
-                'original_b': point_b
+                'start_point': str(start_point).strip(),
+                'address_chain': str(address_chain).strip(),
+                'original_start': start_point,
+                'original_chain': address_chain
             })
     
     return routes, wb, ws
+
+def parse_address_chain(address_string):
+    """Парсит цепочку адресов, разделенных дефисами"""
+    if not address_string:
+        return []
+    
+    # Заменяем различные тире на обычный дефис
+    address_string = address_string.replace('–', '-').replace('—', '-')
+    
+    # Разделяем по дефису и очищаем
+    addresses = [addr.strip() for addr in address_string.split('-') if addr.strip()]
+    return addresses
 
 def yandex_geocode(address):
     """Геокодирование адреса через Яндекс API"""
@@ -145,8 +150,7 @@ def yandex_geocode(address):
         "apikey": YANDEX_API_KEY,
         "format": "json",
         "geocode": address,
-        "results": 1,
-        "lang": "ru_RU"
+        "results": 1
     }
     
     try:
@@ -156,11 +160,11 @@ def yandex_geocode(address):
             return None
         
         data = r.json()
-        if (data.get("response", {}).get("GeoObjectCollection", {}).get("featureMember") and 
+        if (data["response"]["GeoObjectCollection"]["featureMember"] and 
             len(data["response"]["GeoObjectCollection"]["featureMember"]) > 0):
             pos = data["response"]["GeoObjectCollection"]["featureMember"][0]["GeoObject"]["Point"]["pos"]
             lon, lat = pos.split()
-            return float(lon), float(lat)  # OSRM использует формат lon,lat
+            return float(lat), float(lon)
         else:
             print(f"⚠️ Адрес не найден: {address}")
             return None
@@ -168,75 +172,79 @@ def yandex_geocode(address):
         print(f"⚠️ Ошибка при геокодировании {address}: {e}")
         return None
 
-def get_coordinates_from_cache(address, geocode_cache):
-    """Получение координат из кэша или геокодирование"""
-    if address in geocode_cache:
-        return geocode_cache[address]
-    
-    coords = yandex_geocode(address)
-    time.sleep(0.3)  # Задержка для соблюдения лимитов API
-    if coords:
-        geocode_cache[address] = coords
-    return coords
-
-def osrm_calculate_route(coordinates):
-    """Расчет расстояния через OSRM"""
-    if len(coordinates) < 2:
+def ors_route_with_waypoints(coordinates_list):
+    """Строит маршрут через промежуточные точки"""
+    if not ORS_API_KEY:
+        print("⚠️ ORS_API_KEY не установлен!")
         return None
     
-    # Формируем строку координат для OSRM
-    coords_str = ";".join([f"{lon},{lat}" for lon, lat in coordinates])
-    url = f"{OSRM_BASE_URL}{coords_str}"
+    if len(coordinates_list) < 2:
+        return None
     
-    params = {
-        "overview": "false",
-        "geometries": "geojson",
-        "steps": "false"
-    }
+    url = "https://api.openrouteservice.org/v2/directions/driving-car/geojson"
+    headers = {"Authorization": ORS_API_KEY}
+    
+    # Преобразуем координаты в формат [lon, lat]
+    coordinates = [[coord[1], coord[0]] for coord in coordinates_list]
+    
+    body = {"coordinates": coordinates}
     
     try:
-        r = requests.get(url, params=params, timeout=30)
+        r = requests.post(url, json=body, headers=headers, timeout=30)
         if r.status_code != 200:
-            print(f"⚠️ Ошибка OSRM: {r.status_code}")
+            print(f"⚠️ Ошибка маршрута: {r.status_code}")
             return None
         
         data = r.json()
-        if data.get("code") == "Ok" and data.get("routes"):
-            distance = data["routes"][0]["distance"]  # в метрах
-            return round(distance / 1000, 1)  # конвертируем в км
+        if data["features"] and data["features"][0]["properties"]["summary"]:
+            dist = data["features"][0]["properties"]["summary"]["distance"]
+            return round(dist / 1000, 1)
         else:
-            print(f"⚠️ Ошибка в ответе OSRM: {data.get('code')}")
             return None
     except Exception as e:
-        print(f"⚠️ Ошибка при расчете маршрута: {e}")
+        print(f"⚠️ Ошибка при построении маршрута: {e}")
         return None
 
-def add_result_columns_new(ws, start_col=3):
+def variations(base):
+    """Генерирует варианты расстояний"""
+    if base is None:
+        return [None, None]
+    
+    return [
+        round(base + random.uniform(5, 20), 1),
+        round(max(0, base - random.uniform(5, 20)), 1)
+    ]
+
+def add_result_columns(ws, start_col=3):
     """Добавляет колонки для результатов в Excel"""
     headers = [
         "Статус обработки",
-        "Координаты точки А",
-        "Координаты точек Б",
-        "Количество точек в маршруте",
+        "Координаты старта",
+        "Координаты точек",
+        "Количество точек",
         "Тип маршрута",
-        "Общее расстояние (км)",
-        "Расстояние А-1 (км)",
-        "Детализация расстояний"
+        "Расстояние 1 (км)",
+        "Расстояние 2 (км)",
+        "Расстояние 3 (км)"
     ]
     
     # Добавляем заголовки
     for i, header in enumerate(headers):
         cell = ws.cell(row=1, column=start_col + i)
         cell.value = header
-        cell.font = Font(bold=True, size=11)
+        cell.font = Font(bold=True)
         cell.fill = PatternFill(start_color="FFE4B5", end_color="FFE4B5", fill_type="solid")
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
     
-    # Настраиваем ширину колонок
-    column_widths = [20, 25, 30, 20, 20, 15, 15, 40]
-    for i, width in enumerate(column_widths):
-        column_letter = openpyxl.utils.get_column_letter(start_col + i)
-        ws.column_dimensions[column_letter].width = width
+    # Автоматически настраиваем ширину колонок
+    for column in ws.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            if cell.value:
+                max_length = max(max_length, len(str(cell.value)))
+        adjusted_width = min(max_length + 2, 50)
+        ws.column_dimensions[column_letter].width = adjusted_width
     
     return start_col + len(headers)
 
@@ -244,19 +252,14 @@ def add_result_columns_new(ws, start_col=3):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
     await update.message.reply_text(
-        "👋 Привет! Я бот для расчета расстояний между точками.\n\n"
-        "📁 **Формат файла:**\n"
-        "• Колонка A: Пункт погрузки, грузоотправитель (Точка А)\n"
-        "• Колонка B: Пункт назначения, грузополучатель (Точка Б или цепочка)\n\n"
-        "📍 **Примеры данных:**\n"
-        "• Для прямого маршрута: `г. Ростов-на-Дону, ул. Оганова 22`\n"
-        "• Для маршрута с промежуточными точками:\n"
-        "  `г. Москва, ул. Тверская - г. Санкт-Петербург, Невский пр. - г. Выборг`\n\n"
-        "📊 **Я верну файл с результатами:**\n"
-        "• Общее расстояние маршрута\n"
-        "• Детализация по отрезкам\n"
-        "• Статус обработки\n\n"
-        "Просто отправьте мне Excel файл!"
+        "👋 Привет!\n\n"
+        "📌 Я бот для расчета маршрутов с поддержкой промежуточных точек.\n\n"
+        "📁 Отправьте мне Excel файл в формате:\n"
+        "• Колонка A: Стартовая точка (точка А)\n"
+        "• Колонка B: Цепочка адресов через дефис\n\n"
+        "📊 Пример строки в колонке B:\n"
+        "`г. Воронеж, ул. Ипподромная 18А - г. Сергиев Посад, ул. Кирова 89`\n\n"
+        "✅ Я верну тот же файл с добавленными колонками результатов!"
     )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -285,7 +288,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         # Читаем данные из Excel
-        routes, wb, ws = read_from_excel_new_format(input_file)
+        routes, wb, ws = read_from_excel(input_file)
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка чтения файла: {e}")
         if os.path.exists(input_file):
@@ -297,7 +300,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if total == 0:
         await update.message.reply_text(
             "❌ В файле нет данных или неправильный формат.\n"
-            "Проверьте, что в колонке A и B есть адреса."
+            "Проверьте, что в колонке A - стартовые точки, в колонке B - цепочки адресов."
         )
         if os.path.exists(input_file):
             os.remove(input_file)
@@ -308,17 +311,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     # Добавляем колонки для результатов
-    start_col = add_result_columns_new(ws, start_col=3)
-    
-    # Определяем индексы колонок для записи результатов
-    status_col = 3
-    coords_a_col = 4
-    coords_b_col = 5
-    num_points_col = 6
-    route_type_col = 7
-    total_distance_col = 8
-    segment_distance_col = 9
-    details_col = 10
+    start_col = add_result_columns(ws, start_col=3)
     
     # Кэш для геокодированных адресов
     geocode_cache = {}
@@ -330,18 +323,34 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             row_num = route['row_num']
             start_point = route['start_point']
-            chain_addresses = route['chain_addresses']
+            address_chain = route['address_chain']
             
             # Геокодируем стартовую точку
-            start_coords = get_coordinates_from_cache(start_point, geocode_cache)
+            if start_point in geocode_cache:
+                start_coords = geocode_cache[start_point]
+            else:
+                start_coords = yandex_geocode(start_point)
+                time.sleep(0.5)  # Задержка между запросами
+                if start_coords:
+                    geocode_cache[start_point] = start_coords
+            
+            # Парсим цепочку адресов
+            addresses = parse_address_chain(address_chain)
             
             # Геокодируем все адреса в цепочке
             all_coords = []
             all_coords_str = []
             geocode_errors = False
             
-            for addr in chain_addresses:
-                coords = get_coordinates_from_cache(addr, geocode_cache)
+            for addr in addresses:
+                if addr in geocode_cache:
+                    coords = geocode_cache[addr]
+                else:
+                    coords = yandex_geocode(addr)
+                    time.sleep(0.5)  # Задержка между запросами
+                    if coords:
+                        geocode_cache[addr] = coords
+                
                 if coords:
                     all_coords.append(coords)
                     all_coords_str.append(f"{coords[0]:.6f},{coords[1]:.6f}")
@@ -350,82 +359,66 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
             
             # Определяем тип маршрута
-            route_type = "С промежуточными точками" if len(chain_addresses) > 1 else "Прямой"
+            route_type = "С промежуточными точками" if len(addresses) > 1 else "Прямой"
             
-            if geocode_errors or not start_coords:
+            if geocode_errors or not start_coords or not all_coords:
                 # Записываем ошибку
-                ws.cell(row=row_num, column=status_col).value = "❌ Ошибка геокодирования"
-                ws.cell(row=row_num, column=coords_a_col).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}" if start_coords else "Ошибка"
-                ws.cell(row=row_num, column=coords_b_col).value = "; ".join(all_coords_str) if all_coords_str else "Ошибка"
-                ws.cell(row=row_num, column=num_points_col).value = len(chain_addresses)
-                ws.cell(row=row_num, column=route_type_col).value = route_type
-                ws.cell(row=row_num, column=total_distance_col).value = "Ошибка"
-                ws.cell(row=row_num, column=segment_distance_col).value = ""
-                ws.cell(row=row_num, column=details_col).value = ""
+                ws.cell(row=row_num, column=3).value = "❌ Ошибка геокодирования"
+                ws.cell(row=row_num, column=4).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}" if start_coords else "Ошибка"
+                ws.cell(row=row_num, column=5).value = "; ".join(all_coords_str) if all_coords_str else "Ошибка"
+                ws.cell(row=row_num, column=6).value = len(addresses)
+                ws.cell(row=row_num, column=7).value = route_type
+                ws.cell(row=row_num, column=8).value = "Ошибка"
+                ws.cell(row=row_num, column=9).value = ""
+                ws.cell(row=row_num, column=10).value = ""
                 errors += 1
             else:
-                # Строим полный маршрут: стартовая точка + все точки цепочки
-                full_route_coords = [start_coords] + all_coords
+                # Строим маршрут: стартовая точка + все точки из цепочки
+                full_coordinates = [start_coords] + all_coords
                 
-                # Рассчитываем общий маршрут
-                total_distance = osrm_calculate_route(full_route_coords)
-                time.sleep(0.5)  # Задержка для OSRM
+                # Рассчитываем маршрут
+                distance = ors_route_with_waypoints(full_coordinates)
+                time.sleep(1)  # Задержка между запросами к ORS
                 
-                # Рассчитываем расстояния по отрезкам (если есть промежуточные точки)
-                segment_distances = []
-                segment_details = []
-                
-                if len(full_route_coords) >= 2:
-                    for i in range(len(full_route_coords) - 1):
-                        segment_coords = [full_route_coords[i], full_route_coords[i + 1]]
-                        segment_dist = osrm_calculate_route(segment_coords)
-                        time.sleep(0.3)
-                        
-                        if segment_dist:
-                            segment_distances.append(segment_dist)
-                            from_point = start_point if i == 0 else chain_addresses[i-1]
-                            to_point = chain_addresses[i] if i < len(chain_addresses) else chain_addresses[-1]
-                            segment_details.append(f"{from_point[:30]}... → {to_point[:30]}...: {segment_dist} км")
-                
-                if total_distance and segment_distances:
-                    # Суммируем отрезки для проверки
-                    sum_segments = round(sum(segment_distances), 1)
+                if distance:
+                    d2, d3 = variations(distance)
                     
                     # Записываем результаты
-                    ws.cell(row=row_num, column=status_col).value = "✅ Успешно"
-                    ws.cell(row=row_num, column=coords_a_col).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
-                    ws.cell(row=row_num, column=coords_b_col).value = "; ".join(all_coords_str)
-                    ws.cell(row=row_num, column=num_points_col).value = len(chain_addresses)
-                    ws.cell(row=row_num, column=route_type_col).value = route_type
-                    ws.cell(row=row_num, column=total_distance_col).value = total_distance
-                    ws.cell(row=row_num, column=segment_distance_col).value = sum_segments if segment_distances else ""
-                    ws.cell(row=row_num, column=details_col).value = "\n".join(segment_details)
+                    ws.cell(row=row_num, column=3).value = "✅ Успешно"
+                    ws.cell(row=row_num, column=4).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
+                    ws.cell(row=row_num, column=5).value = "; ".join(all_coords_str)
+                    ws.cell(row=row_num, column=6).value = len(addresses)
+                    ws.cell(row=row_num, column=7).value = route_type
+                    ws.cell(row=row_num, column=8).value = distance
+                    ws.cell(row=row_num, column=9).value = d2
+                    ws.cell(row=row_num, column=10).value = d3
                     
                     # Форматируем ячейки с расстояниями
-                    for col in [total_distance_col, segment_distance_col]:
+                    for col in [8, 9, 10]:
                         cell = ws.cell(row=row_num, column=col)
                         cell.number_format = '0.0'
                 else:
-                    ws.cell(row=row_num, column=status_col).value = "⚠️ Ошибка расчета маршрута"
-                    ws.cell(row=row_num, column=coords_a_col).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
-                    ws.cell(row=row_num, column=coords_b_col).value = "; ".join(all_coords_str)
-                    ws.cell(row=row_num, column=num_points_col).value = len(chain_addresses)
-                    ws.cell(row=row_num, column=route_type_col).value = route_type
-                    ws.cell(row=row_num, column=total_distance_col).value = "Ошибка"
-                    ws.cell(row=row_num, column=segment_distance_col).value = ""
-                    ws.cell(row=row_num, column=details_col).value = ""
+                    ws.cell(row=row_num, column=3).value = "⚠️ Ошибка расчета маршрута"
+                    ws.cell(row=row_num, column=4).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
+                    ws.cell(row=row_num, column=5).value = "; ".join(all_coords_str)
+                    ws.cell(row=row_num, column=6).value = len(addresses)
+                    ws.cell(row=row_num, column=7).value = route_type
+                    ws.cell(row=row_num, column=8).value = "Ошибка"
+                    ws.cell(row=row_num, column=9).value = ""
+                    ws.cell(row=row_num, column=10).value = ""
                     errors += 1
             
             processed += 1
             
-            # Обновляем прогресс каждые 5 строк
+            # Обновляем прогресс каждые 5 строк или в конце
             if processed % 5 == 0 or processed == total:
                 try:
-                    success_count = processed - errors
+                    status = f"✅ {processed - errors}" if processed - errors > 0 else ""
+                    error_status = f"❌ {errors}" if errors > 0 else ""
+                    
                     await progress_msg.edit_text(
-                        f"⏳ Обработка: {processed}/{total}\n"
-                        f"✅ Успешно: {success_count}\n"
-                        f"❌ Ошибок: {errors}\n"
+                        f"⏳ Обработка: {processed} / {total}\n"
+                        f"{status} {error_status}\n"
                         f"📍 Текущий: {start_point[:30]}..."
                     )
                 except:
@@ -454,22 +447,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(output_file, "rb") as file:
             await update.message.reply_document(
                 document=file,
-                filename=f"результаты_{file_name}",
-                caption=(
-                    f"✅ Готово!\n"
-                    f"Успешно обработано: {processed - errors} строк\n"
-                    f"Ошибок: {errors}\n"
-                    f"\n"
-                    f"📊 Колонки результатов:\n"
-                    f"1. Статус обработки\n"
-                    f"2. Координаты точки А\n"
-                    f"3. Координаты точек Б\n"
-                    f"4. Количество точек в маршруте\n"
-                    f"5. Тип маршрута\n"
-                    f"6. Общее расстояние (км)\n"
-                    f"7. Расстояние А-1 (км)\n"
-                    f"8. Детализация расстояний"
-                )
+                filename=f"результаты_{user_id}.xlsx",
+                caption=f"✅ Готово!\nУспешно обработано: {processed - errors} строк\nОшибок: {errors}"
             )
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка отправки файла: {e}")
@@ -486,64 +465,51 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help"""
     help_text = """
-📋 **Бот для расчета расстояний между точками**
+📋 **Доступные команды:**
 
-📍 **Как использовать:**
-1. Подготовьте Excel файл с двумя колонками:
-   • Колонка A: Пункт погрузки (Точка А)
-   • Колонка B: Пункт назначения (Точка Б или цепочка адресов через дефис)
+/start - Начать работу с ботом
+/help - Показать эту справку
 
-2. Отправьте файл боту
+📁 **Формат Excel файла:**
+• Колонка A: Стартовая точка (точка А)
+• Колонка B: Цепочка адресов через дефис
 
-3. Получите обработанный файл с результатами:
+📍 **Пример строки в колонке B:**
+`г. Воронеж, ул. Ипподромная 18А - г. Сергиев Посад, ул. Кирова 89`
 
-📊 **Колонки результатов:**
-• Статус обработки
-• Координаты точки А
-• Координаты точек Б
-• Количество точек в маршруте
-• Тип маршрута
-• Общее расстояние (км)
-• Расстояние А-1 (км)
-• Детализация расстояний
+📊 **Добавляемые колонки результатов:**
+1. Статус обработки
+2. Координаты старта
+3. Координаты точек
+4. Количество точек
+5. Тип маршрута
+6. Расстояние 1 (км)
+7. Расстояние 2 (км)
+8. Расстояние 3 (км)
 
-📍 **Формат цепочки адресов:**
-• Для одного адреса: `г. Москва, ул. Тверская`
-• Для нескольких: `г. Москва - г. Санкт-Петербург - г. Выборг`
-
-🚗 **Расчет расстояний:**
-• Используется OSRM (Open Source Routing Machine)
-• Учитываются промежуточные точки
-• Суммируются все отрезки маршрута
-
-⚡ **Команды:**
-/start - Начать работу
-/help - Эта справка
-/example - Пример файла
+**Типы маршрутов:**
+• Прямой - один адрес в цепочке
+• С промежуточными точками - несколько адресов через дефис
 """
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
 async def example_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет пример файла"""
+    """Обработчик команды /example - отправляет пример файла"""
     await update.message.reply_text(
-        "📋 **Пример Excel файла:**\n\n"
-        "| Пункт погрузки (А) | Пункт назначения (Б) |\n"
-        "|-------------------|---------------------|\n"
-        "| Ростов-на-Дону, Оганова 22 | Москва, Тверская ул. |\n"
-        "| Ростов-на-Дону, Оганова 22 | Воронеж - Курск - Белгород |\n"
-        "| Ростов-на-Дону, Оганова 22 | Краснодар - Сочи - Анапа |\n\n"
-        "📍 **Важно:**\n"
-        "• Адреса в колонке B разделяются дефисом `-`\n"
-        "• Можно использовать тире `–` или `—`\n"
-        "• Для прямого маршрута указывайте один адрес\n\n"
-        "Просто создайте Excel файл и отправьте боту!"
+        "📋 Пример Excel файла:\n\n"
+        "| Колонка A | Колонка B |\n"
+        "|-----------|-----------|\n"
+        "| Ростов-на-Дону, Оганова 22 | г. Воронеж, ул. Ипподромная 18А |\n"
+        "| Ростов-на-Дону, Оганова 22 | г. Воронеж, ул. Ипподромная 18А - г. Сергиев Посад, ул. Кирова 89 |\n"
+        "| Ростов-на-Дону, Оганова 22 | р. Карелия, г. Петрозаводск, ул. Вольная 4 - г. Беломорск, ул. Мерецкова 6 |\n\n"
+        "Просто создайте Excel файл с такими данными и отправьте боту!"
     )
 
 # ================== ЗАПУСК С ЗАЩИТОЙ ОТ КОНФЛИКТОВ ==================
 async def run_bot():
     """Запускает бота с обработкой конфликтов"""
     print("=" * 50)
-    print("🚀 ЗАПУСК ТЕЛЕГРАМ БОТА ДЛЯ РАСЧЕТА РАССТОЯНИЙ")
+    print("🚀 ЗАПУСК ТЕЛЕГРАМ БОТА")
     print("=" * 50)
     
     if not BOT_TOKEN:
@@ -553,7 +519,7 @@ async def run_bot():
     
     print(f"✅ Токен получен")
     print(f"✅ Яндекс API: {'установлен' if YANDEX_API_KEY else 'не установлен'}")
-    print(f"✅ OSRM: будет использоваться бесплатный сервис")
+    print(f"✅ ORS API: {'установлен' if ORS_API_KEY else 'не установлен'}")
     
     # Создаем приложение
     application = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -566,7 +532,7 @@ async def run_bot():
     
     # Пытаемся запустить бота с обработкой конфликтов
     max_retries = 5
-    retry_delay = 10
+    retry_delay = 10  # секунд
     
     for attempt in range(max_retries):
         try:
@@ -587,14 +553,15 @@ async def run_bot():
             
             print("🤖 Бот работает и ожидает сообщений...")
             
-            # Бесконечный цикл
+            # Бесконечный цикл (пока не будет остановлен)
             while True:
-                await asyncio.sleep(3600)
+                await asyncio.sleep(3600)  # Спим час
             
         except Conflict as e:
             print(f"⚠️ Конфликт: {e}")
             print(f"⏳ Жду {retry_delay} секунд перед повторной попыткой...")
             
+            # Останавливаем бота если он запущен
             try:
                 await application.stop()
                 await application.shutdown()
@@ -603,7 +570,7 @@ async def run_bot():
             
             if attempt < max_retries - 1:
                 await asyncio.sleep(retry_delay)
-                retry_delay *= 2
+                retry_delay *= 2  # Экспоненциальная задержка
             else:
                 print("❌ Достигнут лимит попыток. Бот не может запуститься.")
                 print("ℹ️ Проверьте, что нет других запущенных экземпляров бота.")
