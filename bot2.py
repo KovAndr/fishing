@@ -95,269 +95,273 @@ def run_flask():
 # ================== НАСТРОЙКИ БОТА ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "")
-GRAPHOPPER_API_KEY = os.getenv("GRAPHOPPER_API_KEY", "2c8e643a-360f-47ab-855d-7e884ce217ad")  # Ваш ключ
+GRAPHOPPER_API_KEY = os.getenv("GRAPHOPPER_API_KEY", "2c8e643a-360f-47ab-855d-7e884ce217ad")
 
-# ================== ЛОГИКА БОТА ==================
-def read_from_docx(path):
-    """Чтение адресов из DOCX файла"""
-    doc = Document(path)
-    lines = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-    return [l for l in lines if len(l) > 10 and not l.replace(' ', '').isdigit()]
+# ================== УЛУЧШЕННАЯ ЛОГИКА БОТА ==================
+def clean_address_enhanced(address):
+    """Улучшенная очистка адреса"""
+    if not address:
+        return ""
+    
+    # Удаляем почтовый индекс в начале
+    address = re.sub(r'^\d{6},\s*', '', address)
+    
+    # Нормализуем пробелы
+    address = ' '.join(address.split())
+    
+    # Заменяем все виды тире на обычный дефис
+    address = re.sub(r'[–—−]', '-', address)
+    
+    # Удаляем лишние символы, но сохраняем буквы, цифры, пробелы, запятые, точки, дефисы
+    address = re.sub(r'[^\w\s\.,\-]', '', address)
+    
+    # Удаляем мусорные слова
+    address = re.sub(r'\b(?:ул\.|ул\b|пер\.|пр\.|пр-т|пр-кт|б-р|ш\.|г\.|г\b|обл\.|р-н|р\b|с\.|ст-ца|х\.|п\.|пос\.|мкр\.|кв\.|д\.|корп\.|стр\.|лит\.)\b\.?', '', address, flags=re.IGNORECASE)
+    
+    # Нормализуем запятые
+    address = re.sub(r'\s*,\s*', ', ', address)
+    
+    # Удаляем двойные пробелы
+    address = re.sub(r'\s+', ' ', address)
+    
+    return address.strip()
 
-def read_from_excel(path):
-    """Чтение маршрутов из Excel файла с двумя колонками: стартовая точка и цепочка адресов"""
+def parse_address_chain_enhanced(address_string):
+    """Улучшенный парсинг цепочки адресов"""
+    if not address_string:
+        return []
+    
+    # Нормализуем разделители
+    address_string = re.sub(r'[–—−]', '-', address_string)
+    
+    # Заменяем " - " на разделитель
+    address_string = re.sub(r'\s*-\s*', '|SEP|', address_string)
+    
+    # Разделяем
+    parts = address_string.split('|SEP|')
+    
+    # Очищаем и фильтруем
+    addresses = []
+    for part in parts:
+        cleaned = clean_address_enhanced(part)
+        if cleaned and len(cleaned) > 5:
+            addresses.append(cleaned)
+    
+    return addresses
+
+def validate_coordinates(lat, lon):
+    """Проверка координат на валидность (в пределах России и близлежащих стран)"""
     try:
-        wb = load_workbook(path, data_only=True, read_only=False)
+        # Российские координаты и ближнее зарубежье
+        if 40 <= lat <= 80 and 19 <= lon <= 180:
+            return True
+        return False
+    except:
+        return False
+
+def graphhopper_geocode_enhanced(address, max_retries=3):
+    """Улучшенное геокодирование через GraphHopper с повторными попытками"""
+    if not GRAPHOPPER_API_KEY:
+        print("⚠️ GRAPHOPPER_API_KEY не установлен!")
+        return None
+    
+    cleaned_address = clean_address_enhanced(address)
+    
+    for attempt in range(max_retries):
+        try:
+            url = "https://graphhopper.com/api/1/geocode"
+            params = {
+                "q": f"{cleaned_address}, Россия",
+                "locale": "ru",
+                "limit": 1,
+                "key": GRAPHOPPER_API_KEY,
+                "provider": "default"
+            }
+            
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+            
+            response = requests.get(url, params=params, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("hits") and len(data["hits"]) > 0:
+                    lat = data["hits"][0]["point"]["lat"]
+                    lon = data["hits"][0]["point"]["lng"]
+                    
+                    if validate_coordinates(lat, lon):
+                        return (lat, lon)
+                    else:
+                        print(f"⚠️ Невалидные координаты для {address}: {lat}, {lon}")
+                        return None
+                else:
+                    print(f"⚠️ Адрес не найден: {address}")
+                    
+            elif response.status_code == 429:
+                wait_time = 2 ** attempt
+                print(f"⚠️ Rate limit, жду {wait_time} секунд...")
+                time.sleep(wait_time)
+                continue
+                
+            else:
+                print(f"⚠️ Ошибка геокодирования {address}: {response.status_code}")
+                
+        except Exception as e:
+            print(f"⚠️ Ошибка при геокодировании {address}: {e}")
+        
+        time.sleep(1)  # Пауза между попытками
+    
+    return None
+
+def graphhopper_route_simple(points, profile="car"):
+    """Простой расчет маршрута через GraphHopper (до 10 точек)"""
+    if not GRAPHOPPER_API_KEY:
+        print("⚠️ GRAPHOPPER_API_KEY не установлен!")
+        return None
+    
+    if len(points) < 2:
+        return None
+    
+    try:
+        # Формируем строку точек
+        points_param = []
+        for lat, lon in points:
+            points_param.append(f"point={lat},{lon}")
+        
+        points_str = "&".join(points_param)
+        
+        url = f"https://graphhopper.com/api/1/route?{points_str}&profile={profile}&locale=ru&instructions=false&calc_points=false&key={GRAPHOPPER_API_KEY}"
+        
+        response = requests.get(url, timeout=60)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if "paths" in data and len(data["paths"]) > 0:
+                distance_meters = data["paths"][0]["distance"]
+                distance_km = distance_meters / 1000
+                
+                # Базовые проверки на валидность расстояния
+                if 1 <= distance_km <= 20000:
+                    return round(distance_km, 1)
+                else:
+                    print(f"⚠️ Нереалистичное расстояние: {distance_km} км")
+                    return None
+            else:
+                print(f"⚠️ Нет данных о маршруте")
+                return None
+        else:
+            print(f"⚠️ Ошибка API: {response.status_code}, текст: {response.text[:200]}")
+            return None
+            
+    except Exception as e:
+        print(f"⚠️ Ошибка при построении маршрута: {e}")
+        return None
+
+def calculate_route_optimized(points):
+    """Оптимизированный расчет маршрута"""
+    if len(points) < 2:
+        return None
+    
+    # Ограничиваем количество точек для одного запроса
+    if len(points) > 15:
+        print(f"⚠️ Слишком много точек ({len(points)}), ограничиваю до 10")
+        points = points[:10]  # Берем только первые 10 точек
+    
+    # Пробуем разные профили транспорта
+    profiles = ["car", "small_truck", "truck"]
+    
+    for profile in profiles:
+        distance = graphhopper_route_simple(points, profile)
+        if distance:
+            print(f"✅ Успешно рассчитано с профилем {profile}: {distance} км")
+            return distance
+        
+        time.sleep(1)  # Пауза между попытками
+    
+    return None
+
+def variations_enhanced(base_distance):
+    """Генерация вариаций расстояния"""
+    if base_distance is None or base_distance <= 0:
+        return [None, None]
+    
+    try:
+        # Рассчитываем отклонение в зависимости от расстояния
+        if base_distance < 100:
+            # Для коротких расстояний - небольшой процент
+            deviation_percent = random.uniform(2, 5)
+        elif base_distance < 500:
+            deviation_percent = random.uniform(3, 7)
+        elif base_distance < 1000:
+            deviation_percent = random.uniform(4, 8)
+        else:
+            # Для длинных расстояний - фиксированный процент
+            deviation_percent = random.uniform(5, 10)
+        
+        deviation = base_distance * deviation_percent / 100
+        
+        return [
+            round(base_distance + deviation, 1),
+            round(max(1, base_distance - deviation), 1)
+        ]
+    except:
+        return [
+            round(base_distance * 1.05, 1),
+            round(base_distance * 0.95, 1)
+        ]
+
+def read_from_excel_enhanced(path):
+    """Улучшенное чтение Excel файла"""
+    try:
+        wb = load_workbook(path, data_only=True)
         ws = wb.active
         
-        # Определяем максимальную строку
-        max_row = ws.max_row
         routes = []
         
-        # Определяем тип файла: проверяем заголовки
-        first_row_values = []
-        for cell in ws[1]:
-            if cell.value:
-                first_row_values.append(str(cell.value).lower())
+        # Ищем колонки с данными
+        start_col = None
+        chain_col = None
         
-        has_headers = any(keyword in ' '.join(first_row_values) for keyword in ['пункт', 'адрес', 'точка', 'маршрут'])
+        # Пробуем найти заголовки
+        for col in range(1, min(10, ws.max_column + 1)):
+            cell_value = ws.cell(row=1, column=col).value
+            if cell_value:
+                cell_lower = str(cell_value).lower()
+                if any(keyword in cell_lower for keyword in ['пункт', 'отправ', 'старт', 'начало']):
+                    start_col = col
+                elif any(keyword in cell_lower for keyword in ['пункт', 'назнач', 'цель', 'адрес', 'маршрут', 'точк']):
+                    chain_col = col
         
-        start_row = 1
-        if has_headers:
-            start_row = 2
+        # Если не нашли заголовки, используем первые две колонки
+        if start_col is None:
+            start_col = 1
+        if chain_col is None:
+            chain_col = 2
         
         # Читаем данные
-        for row in range(start_row, max_row + 1):
-            start_point = ws.cell(row=row, column=1).value
-            address_chain = ws.cell(row=row, column=2).value
+        start_row = 2 if ws.cell(row=1, column=start_col).value else 1
+        
+        for row in range(start_row, ws.max_row + 1):
+            start_point = ws.cell(row=row, column=start_col).value
+            address_chain = ws.cell(row=row, column=chain_col).value
             
-            # Проверяем, что есть оба значения
             if start_point and address_chain:
                 routes.append({
                     'row_num': row,
                     'start_point': str(start_point).strip(),
-                    'address_chain': str(address_chain).strip(),
-                    'original_start': start_point,
-                    'original_chain': address_chain
+                    'address_chain': str(address_chain).strip()
                 })
         
+        print(f"📊 Прочитано {len(routes)} маршрутов из файла")
         return routes, wb, ws
+        
     except Exception as e:
-        print(f"Ошибка чтения Excel: {e}")
+        print(f"❌ Ошибка чтения Excel: {e}")
         return [], None, None
 
-def parse_address_chain(address_string):
-    """Парсит цепочку адресов, разделенных дефисами"""
-    if not address_string:
-        return []
-    
-    # Заменяем различные тире на обычный дефис
-    address_string = address_string.replace('–', '-').replace('—', '-').replace(' - ', '-').replace(' -', '-').replace('- ', '-')
-    
-    # Разделяем по дефису и очищаем
-    addresses = [addr.strip() for addr in address_string.split('-') if addr.strip()]
-    return addresses
-
-def clean_address(address):
-    """Очистка адреса от лишних символов"""
-    if not address:
-        return ""
-    
-    # Убираем лишние пробелы
-    address = ' '.join(address.split())
-    
-    # Убираем координаты в скобках
-    address = re.sub(r'\([^)]*\)', '', address)
-    
-    # Убираем специальные символы кроме запятых, точек и цифр
-    address = re.sub(r'[^\w\s.,-]', '', address, flags=re.UNICODE)
-    
-    return address.strip()
-
-def yandex_geocode(address):
-    """Геокодирование адреса через Яндекс API"""
-    if not YANDEX_API_KEY:
-        print("⚠️ YANDEX_API_KEY не установлен!")
-        return None
-    
-    # Очищаем адрес
-    address = clean_address(address)
-    
-    url = "https://geocode-maps.yandex.ru/1.x/"
-    params = {
-        "apikey": YANDEX_API_KEY,
-        "format": "json",
-        "geocode": address,
-        "results": 1,
-        "lang": "ru_RU"
-    }
-    
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        if r.status_code != 200:
-            print(f"⚠️ Ошибка геокодирования: {r.status_code} для адреса: {address}")
-            return None
-        
-        data = r.json()
-        if (data["response"]["GeoObjectCollection"]["featureMember"] and 
-            len(data["response"]["GeoObjectCollection"]["featureMember"]) > 0):
-            pos = data["response"]["GeoObjectCollection"]["featureMember"][0]["GeoObject"]["Point"]["pos"]
-            lon, lat = pos.split()
-            return float(lat), float(lon)
-        else:
-            print(f"⚠️ Адрес не найден: {address}")
-            return None
-    except Exception as e:
-        print(f"⚠️ Ошибка при геокодировании {address}: {e}")
-        return None
-
-def graphhopper_geocode(address):
-    """Геокодирование через GraphHopper"""
-    if not GRAPHOPPER_API_KEY:
-        print("⚠️ GRAPHOPPER_API_KEY не установлен!")
-        return None
-    
-    # Очищаем адрес
-    address = clean_address(address)
-    
-    url = "https://graphhopper.com/api/1/geocode"
-    params = {
-        "q": address,
-        "locale": "ru",
-        "limit": 1,
-        "key": GRAPHOPPER_API_KEY
-    }
-    
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        if r.status_code != 200:
-            print(f"⚠️ Ошибка геокодирования GraphHopper: {r.status_code} для адреса: {address}")
-            return None
-        
-        data = r.json()
-        if data.get("hits") and len(data["hits"]) > 0:
-            lat = data["hits"][0]["point"]["lat"]
-            lon = data["hits"][0]["point"]["lng"]
-            return float(lat), float(lon)
-        else:
-            print(f"⚠️ Адрес не найден GraphHopper: {address}")
-            return None
-    except Exception as e:
-        print(f"⚠️ Ошибка при геокодировании GraphHopper {address}: {e}")
-        return None
-
-def graphhopper_route(coordinates_list, profile="car"):
-    """Расчет маршрута через GraphHopper API"""
-    if not GRAPHOPPER_API_KEY:
-        print("⚠️ GRAPHOPPER_API_KEY не установлен!")
-        return None
-    
-    if len(coordinates_list) < 2:
-        return None
-    
-    # Ограничиваем количество точек для одного запроса
-    if len(coordinates_list) > 50:
-        print(f"⚠️ Слишком много точек: {len(coordinates_list)}, ограничиваю до 50")
-        coordinates_list = coordinates_list[:50]
-    
-    # Формируем параметры точек
-    points_param = []
-    for i, coord in enumerate(coordinates_list):
-        if i > 0:
-            points_param.append(f"point={coord[0]}%2C{coord[1]}")
-        else:
-            points_param.append(f"point={coord[0]}%2C{coord[1]}")
-    
-    points_str = "&".join(points_param)
-    
-    url = f"https://graphhopper.com/api/1/route?{points_str}&profile={profile}&locale=ru&instructions=false&calc_points=false&key={GRAPHOPPER_API_KEY}"
-    
-    try:
-        r = requests.get(url, timeout=60)
-        if r.status_code != 200:
-            print(f"⚠️ Ошибка GraphHopper API: {r.status_code}, текст: {r.text[:200]}")
-            return None
-        
-        data = r.json()
-        if "paths" in data and len(data["paths"]) > 0:
-            # Расстояние в метрах
-            distance_meters = data["paths"][0]["distance"]
-            # Переводим в километры
-            distance_km = distance_meters / 1000
-            
-            # Проверяем на валидность расстояния
-            if distance_km < 0.1 or distance_km > 20000:
-                print(f"⚠️ Подозрительное расстояние: {distance_km} км")
-                return None
-                
-            return round(distance_km, 1)
-        else:
-            print(f"⚠️ Нет маршрута в ответе GraphHopper")
-            return None
-    except Exception as e:
-        print(f"⚠️ Ошибка при построении маршрута GraphHopper: {e}")
-        return None
-
-def calculate_route_distance(coordinates_list):
-    """Основная функция расчета маршрута с использованием GraphHopper"""
-    try:
-        # Пытаемся рассчитать через GraphHopper
-        distance = graphhopper_route(coordinates_list, profile="car")
-        
-        # Если не получилось, пробуем другой профиль
-        if distance is None:
-            distance = graphhopper_route(coordinates_list, profile="truck")
-            
-        # Если все еще не получилось, пробуем разбить на части
-        if distance is None and len(coordinates_list) > 10:
-            print("⚠️ Пробуем рассчитать маршрут частями...")
-            # Разбиваем на части по 10 точек
-            total_distance = 0
-            for i in range(0, len(coordinates_list) - 1, 9):
-                chunk = coordinates_list[i:i+10]
-                if len(chunk) < 2:
-                    continue
-                    
-                chunk_distance = graphhopper_route(chunk, profile="car")
-                if chunk_distance:
-                    total_distance += chunk_distance
-                    time.sleep(0.5)  # Задержка между запросами
-                else:
-                    return None
-            
-            if total_distance > 0:
-                return round(total_distance, 1)
-        
-        return distance
-    except Exception as e:
-        print(f"⚠️ Общая ошибка расчета маршрута: {e}")
-        return None
-
-def variations(base):
-    """Генерирует варианты расстояний"""
-    if base is None:
-        return [None, None]
-    
-    try:
-        # Разные варианты отклонений в зависимости от расстояния
-        if base < 100:
-            deviation = random.uniform(2, 10)
-        elif base < 500:
-            deviation = random.uniform(5, 20)
-        elif base < 1000:
-            deviation = random.uniform(10, 40)
-        else:
-            deviation = random.uniform(20, 80)
-        
-        return [
-            round(base + deviation, 1),
-            round(max(0.1, base - deviation), 1)
-        ]
-    except:
-        return [round(base * 1.05, 1), round(base * 0.95, 1)]
-
-def add_result_columns(ws, start_col=3):
-    """Добавляет колонки для результатов в Excel"""
+def add_result_columns_enhanced(ws):
+    """Добавление колонок для результатов"""
     headers = [
         "Статус обработки",
         "Координаты старта",
@@ -369,42 +373,47 @@ def add_result_columns(ws, start_col=3):
         "Расстояние 3 (км)"
     ]
     
-    # Определяем, есть ли уже заголовки
-    existing_header = ws.cell(row=1, column=start_col).value
+    # Определяем первую пустую колонку
+    result_start_col = ws.max_column + 1
     
-    if not existing_header or "Статус обработки" not in str(existing_header):
-        # Добавляем заголовки
-        for i, header in enumerate(headers):
-            cell = ws.cell(row=1, column=start_col + i)
-            cell.value = header
-            cell.font = Font(bold=True)
-            cell.fill = PatternFill(start_color="FFE4B5", end_color="FFE4B5", fill_type="solid")
-            cell.alignment = Alignment(horizontal="center", vertical="center")
+    # Добавляем заголовки
+    for i, header in enumerate(headers):
+        cell = ws.cell(row=1, column=result_start_col + i)
+        cell.value = header
+        cell.font = Font(bold=True, color="000000")
+        cell.fill = PatternFill(start_color="FFE4B5", end_color="FFE4B5", fill_type="solid")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     
-    # Автоматически настраиваем ширину колонок
-    for column in ws.columns:
-        max_length = 0
-        column_letter = column[0].column_letter
-        for cell in column:
-            if cell.value:
-                max_length = max(max_length, len(str(cell.value)))
-        adjusted_width = min(max_length + 2, 50)
-        ws.column_dimensions[column_letter].width = adjusted_width
+    # Настраиваем ширину колонок
+    for col in range(ws.max_column + 1, ws.max_column + len(headers) + 1):
+        col_letter = openpyxl.utils.get_column_letter(col)
+        if col - ws.max_column - 1 == 0:  # Статус
+            ws.column_dimensions[col_letter].width = 20
+        elif col - ws.max_column - 1 == 1:  # Координаты старта
+            ws.column_dimensions[col_letter].width = 25
+        elif col - ws.max_column - 1 == 2:  # Координаты точек
+            ws.column_dimensions[col_letter].width = 40
+        elif col - ws.max_column - 1 == 3:  # Количество точек
+            ws.column_dimensions[col_letter].width = 15
+        elif col - ws.max_column - 1 == 4:  # Тип маршрута
+            ws.column_dimensions[col_letter].width = 25
+        else:  # Расстояния
+            ws.column_dimensions[col_letter].width = 18
     
-    return start_col + len(headers)
+    return result_start_col
 
 # ================== TELEGRAM БОТ ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
     await update.message.reply_text(
-        "👋 Привет!\n\n"
-        "📌 Я бот для расчета маршрутов с поддержкой промежуточных точек.\n\n"
-        "📁 Отправьте мне Excel файл в формате:\n"
-        "• Колонка A: Стартовая точка (точка А)\n"
-        "• Колонка B: Цепочка адресов через дефис\n\n"
-        "📊 Пример строки в колонке B:\n"
-        "`г. Воронеж, ул. Ипподромная 18А - г. Сергиев Посад, ул. Кирова 89`\n\n"
-        "✅ Я верну тот же файл с добавленными колонками результатов!"
+        "👋 Привет! Я бот для расчета маршрутов.\n\n"
+        "📁 **Отправьте мне Excel файл в формате:**\n"
+        "• Колонка 1: Стартовая точка\n"
+        "• Колонка 2: Цепочка адресов через дефис\n\n"
+        "📋 **Пример строки:**\n"
+        "`Ростов-на-Дону, Оганова 22`\n"
+        "`Воронеж, ул. Ипподромная 18А - Сергиев Посад, ул. Кирова 89`\n\n"
+        "✅ Я верну файл с рассчитанными расстояниями!"
     )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -414,106 +423,105 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     file_name = update.message.document.file_name.lower()
-    allowed_extensions = ['.xlsx', '.xls']
-    
-    if not any(file_name.endswith(ext) for ext in allowed_extensions):
-        await update.message.reply_text(
-            "❌ Пожалуйста, отправьте файл в формате Excel (XLSX/XLS)"
-        )
+    if not (file_name.endswith('.xlsx') or file_name.endswith('.xls')):
+        await update.message.reply_text("❌ Пожалуйста, отправьте Excel файл (.xlsx или .xls)")
         return
     
+    # Скачиваем файл
     file = await update.message.document.get_file()
     user_id = update.message.from_user.id
-    
-    # Создаем уникальное имя файла
     timestamp = int(time.time())
     input_file = f"input_{user_id}_{timestamp}.xlsx"
     
-    await file.download_to_drive(input_file)
-    
     try:
-        # Читаем данные из Excel
-        routes, wb, ws = read_from_excel(input_file)
-        if not routes:
-            await update.message.reply_text(
-                "❌ В файле нет данных или неправильный формат.\n"
-                "Проверьте, что в колонке A - стартовые точки, в колонке B - цепочки адресов."
-            )
-            if os.path.exists(input_file):
-                os.remove(input_file)
-            return
+        await file.download_to_drive(input_file)
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка чтения файла: {e}")
+        await update.message.reply_text(f"❌ Ошибка загрузки файла: {e}")
+        return
+    
+    # Читаем данные
+    routes, wb, ws = read_from_excel_enhanced(input_file)
+    if not routes:
+        await update.message.reply_text(
+            "❌ Не удалось прочитать данные из файла.\n"
+            "Убедитесь, что файл содержит минимум 2 колонки с адресами."
+        )
         if os.path.exists(input_file):
             os.remove(input_file)
         return
     
-    total = len(routes)
+    # Добавляем колонки для результатов
+    result_start_col = add_result_columns_enhanced(ws)
     
+    # Отправляем сообщение о начале обработки
+    total_routes = len(routes)
     progress_msg = await update.message.reply_text(
-        f"⏳ Начинаю обработку\nВсего строк: {total}\nОбработка..."
+        f"⏳ Начинаю обработку...\n"
+        f"Всего маршрутов: {total_routes}\n"
+        f"Статус: готовится..."
     )
     
-    # Добавляем колонки для результатов
-    start_col = add_result_columns(ws, start_col=3)
-    
-    # Кэш для геокодированных адресов
+    # Кэш для геокодирования
     geocode_cache = {}
     
-    processed = 0
-    errors = 0
-    geocode_errors = 0
-    route_errors = 0
+    # Статистика
+    stats = {
+        'processed': 0,
+        'success': 0,
+        'geocode_errors': 0,
+        'route_errors': 0
+    }
     
+    # Обрабатываем каждый маршрут
     for route in routes:
         try:
             row_num = route['row_num']
             start_point = route['start_point']
             address_chain = route['address_chain']
             
-            # Проверяем, есть ли уже результаты в этой строке
-            existing_status = ws.cell(row=row_num, column=start_col).value
-            if existing_status and "✅" in str(existing_status):
-                processed += 1
+            # Проверяем, не обрабатывалась ли уже эта строка
+            existing_status = ws.cell(row=row_num, column=result_start_col).value
+            if existing_status and ("✅" in str(existing_status) or "⚠️" in str(existing_status)):
+                stats['processed'] += 1
                 continue
             
             # Геокодируем стартовую точку
             if start_point in geocode_cache:
                 start_coords = geocode_cache[start_point]
             else:
-                # Сначала пробуем Яндекс, потом GraphHopper
-                start_coords = yandex_geocode(start_point)
-                if not start_coords:
-                    time.sleep(0.3)
-                    start_coords = graphhopper_geocode(start_point)
-                
-                if start_coords:
-                    geocode_cache[start_point] = start_coords
-                else:
-                    geocode_cache[start_point] = None
+                start_coords = graphhopper_geocode_enhanced(start_point)
+                geocode_cache[start_point] = start_coords
+                time.sleep(0.5)  # Пауза между запросами геокодирования
+            
+            if not start_coords:
+                # Записываем ошибку геокодирования
+                ws.cell(row=row_num, column=result_start_col).value = "⚠️ Ошибка геокодирования"
+                ws.cell(row=row_num, column=result_start_col + 5).value = "Ошибка"
+                stats['geocode_errors'] += 1
+                stats['processed'] += 1
+                continue
             
             # Парсим цепочку адресов
-            addresses = parse_address_chain(address_chain)
+            addresses = parse_address_chain_enhanced(address_chain)
+            if not addresses:
+                ws.cell(row=row_num, column=result_start_col).value = "⚠️ Нет адресов в цепочке"
+                ws.cell(row=row_num, column=result_start_col + 5).value = "Ошибка"
+                stats['geocode_errors'] += 1
+                stats['processed'] += 1
+                continue
             
-            # Геокодируем все адреса в цепочке
+            # Геокодируем адреса из цепочки
             all_coords = []
             all_coords_str = []
             geocode_failed = False
             
-            for idx, addr in enumerate(addresses):
+            for addr in addresses:
                 if addr in geocode_cache:
                     coords = geocode_cache[addr]
                 else:
-                    # Сначала пробуем Яндекс, потом GraphHopper
-                    coords = yandex_geocode(addr)
-                    if not coords:
-                        time.sleep(0.3)
-                        coords = graphhopper_geocode(addr)
-                    
-                    if coords:
-                        geocode_cache[addr] = coords
-                    else:
-                        geocode_cache[addr] = None
+                    coords = graphhopper_geocode_enhanced(addr)
+                    geocode_cache[addr] = coords
+                    time.sleep(0.5)  # Пауза между запросами геокодирования
                 
                 if coords:
                     all_coords.append(coords)
@@ -523,94 +531,72 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     print(f"❌ Не удалось геокодировать адрес: {addr}")
                     break
             
+            if geocode_failed or not all_coords:
+                ws.cell(row=row_num, column=result_start_col).value = "⚠️ Ошибка геокодирования точек"
+                ws.cell(row=row_num, column=result_start_col + 1).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
+                ws.cell(row=row_num, column=result_start_col + 2).value = "; ".join(all_coords_str) if all_coords_str else "Ошибка"
+                ws.cell(row=row_num, column=result_start_col + 3).value = len(addresses)
+                ws.cell(row=row_num, column=result_start_col + 4).value = "С промежуточными точками" if len(addresses) > 1 else "Прямой"
+                ws.cell(row=row_num, column=result_start_col + 5).value = "Ошибка"
+                stats['geocode_errors'] += 1
+                stats['processed'] += 1
+                continue
+            
             # Определяем тип маршрута
             route_type = "С промежуточными точками" if len(addresses) > 1 else "Прямой"
             
-            if geocode_failed or not start_coords or not all_coords:
-                # Записываем ошибку геокодирования
-                ws.cell(row=row_num, column=start_col).value = "❌ Ошибка геокодирования"
-                ws.cell(row=row_num, column=start_col + 1).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}" if start_coords else "Ошибка"
-                ws.cell(row=row_num, column=start_col + 2).value = "; ".join(all_coords_str) if all_coords_str else "Ошибка"
-                ws.cell(row=row_num, column=start_col + 3).value = len(addresses)
-                ws.cell(row=row_num, column=start_col + 4).value = route_type
-                ws.cell(row=row_num, column=start_col + 5).value = "Ошибка"
-                ws.cell(row=row_num, column=start_col + 6).value = ""
-                ws.cell(row=row_num, column=start_col + 7).value = ""
-                errors += 1
-                geocode_errors += 1
+            # Рассчитываем маршрут
+            full_coordinates = [start_coords] + all_coords
+            distance = calculate_route_optimized(full_coordinates)
+            time.sleep(1)  # Пауза между запросами расчета маршрута
+            
+            if distance:
+                # Генерируем вариации
+                d2, d3 = variations_enhanced(distance)
+                
+                # Записываем результаты
+                ws.cell(row=row_num, column=result_start_col).value = "✅ Успешно"
+                ws.cell(row=row_num, column=result_start_col + 1).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
+                ws.cell(row=row_num, column=result_start_col + 2).value = "; ".join(all_coords_str)
+                ws.cell(row=row_num, column=result_start_col + 3).value = len(addresses)
+                ws.cell(row=row_num, column=result_start_col + 4).value = route_type
+                ws.cell(row=row_num, column=result_start_col + 5).value = distance
+                ws.cell(row=row_num, column=result_start_col + 6).value = d2
+                ws.cell(row=row_num, column=result_start_col + 7).value = d3
+                
+                stats['success'] += 1
             else:
-                # Строим маршрут: стартовая точка + все точки из цепочки
-                full_coordinates = [start_coords] + all_coords
+                ws.cell(row=row_num, column=result_start_col).value = "⚠️ Ошибка расчета маршрута"
+                ws.cell(row=row_num, column=result_start_col + 1).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
+                ws.cell(row=row_num, column=result_start_col + 2).value = "; ".join(all_coords_str)
+                ws.cell(row=row_num, column=result_start_col + 3).value = len(addresses)
+                ws.cell(row=row_num, column=result_start_col + 4).value = route_type
+                ws.cell(row=row_num, column=result_start_col + 5).value = "Ошибка"
+                ws.cell(row=row_num, column=result_start_col + 6).value = ""
+                ws.cell(row=row_num, column=result_start_col + 7).value = ""
                 
-                # Рассчитываем маршрут
-                distance = calculate_route_distance(full_coordinates)
-                time.sleep(0.5)  # Задержка между запросами к API
-                
-                if distance:
-                    d2, d3 = variations(distance)
-                    
-                    # Записываем результаты
-                    ws.cell(row=row_num, column=start_col).value = "✅ Успешно"
-                    ws.cell(row=row_num, column=start_col + 1).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
-                    ws.cell(row=row_num, column=start_col + 2).value = "; ".join(all_coords_str)
-                    ws.cell(row=row_num, column=start_col + 3).value = len(addresses)
-                    ws.cell(row=row_num, column=start_col + 4).value = route_type
-                    ws.cell(row=row_num, column=start_col + 5).value = distance
-                    ws.cell(row=row_num, column=start_col + 6).value = d2
-                    ws.cell(row=row_num, column=start_col + 7).value = d3
-                    
-                    # Форматируем ячейки с расстояниями
-                    for col in [start_col + 5, start_col + 6, start_col + 7]:
-                        cell = ws.cell(row=row_num, column=col)
-                        cell.number_format = '0.0'
-                else:
-                    ws.cell(row=row_num, column=start_col).value = "⚠️ Ошибка расчета маршрута"
-                    ws.cell(row=row_num, column=start_col + 1).value = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
-                    ws.cell(row=row_num, column=start_col + 2).value = "; ".join(all_coords_str)
-                    ws.cell(row=row_num, column=start_col + 3).value = len(addresses)
-                    ws.cell(row=row_num, column=start_col + 4).value = route_type
-                    ws.cell(row=row_num, column=start_col + 5).value = "Ошибка"
-                    ws.cell(row=row_num, column=start_col + 6).value = ""
-                    ws.cell(row=row_num, column=start_col + 7).value = ""
-                    errors += 1
-                    route_errors += 1
+                stats['route_errors'] += 1
             
-            processed += 1
+            stats['processed'] += 1
             
-            # Обновляем прогресс каждые 5 строк или в конце
-            if processed % 5 == 0 or processed == total:
+            # Обновляем прогресс каждые 5 маршрутов
+            if stats['processed'] % 5 == 0 or stats['processed'] == total_routes:
                 try:
-                    success_count = processed - errors
-                    
                     progress_text = (
-                        f"⏳ Обработка: {processed} / {total}\n"
-                        f"✅ Успешно: {success_count}\n"
-                        f"❌ Ошибок: {errors}\n"
+                        f"⏳ Обработка: {stats['processed']} / {total_routes}\n"
+                        f"✅ Успешно: {stats['success']}\n"
+                        f"📍 Ошибки геокодирования: {stats['geocode_errors']}\n"
+                        f"🛣️ Ошибки расчета: {stats['route_errors']}\n"
+                        f"⏱️ API: GraphHopper"
                     )
-                    
-                    if geocode_errors > 0:
-                        progress_text += f"📍 Геокодирование: {geocode_errors}\n"
-                    if route_errors > 0:
-                        progress_text += f"🛣️ Маршруты: {route_errors}"
-                    
                     await progress_msg.edit_text(progress_text)
                 except:
                     pass
                 
         except Exception as e:
-            print(f"❌ Ошибка обработки строки {route.get('row_num', 'N/A')}: {e}")
-            errors += 1
-            processed += 1
-    
-    try:
-        await progress_msg.edit_text(
-            f"✅ Обработка завершена!\n"
-            f"Успешно: {processed - errors}\n"
-            f"Ошибок: {errors}\n"
-            f"Формирую отчет..."
-        )
-    except:
-        pass
+            print(f"❌ Критическая ошибка при обработке строки {route.get('row_num', 'N/A')}: {e}")
+            stats['processed'] += 1
+            stats['route_errors'] += 1
     
     # Сохраняем результат
     output_file = f"results_{user_id}_{timestamp}.xlsx"
@@ -618,28 +604,36 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Отправляем результат
     try:
+        final_text = (
+            f"✅ Обработка завершена!\n\n"
+            f"📊 **Статистика:**\n"
+            f"• Всего маршрутов: {total_routes}\n"
+            f"• ✅ Успешно: {stats['success']}\n"
+            f"• 📍 Ошибки геокодирования: {stats['geocode_errors']}\n"
+            f"• 🛣️ Ошибки расчета: {stats['route_errors']}\n\n"
+            f"🔧 Использованный API: GraphHopper"
+        )
+        
+        await update.message.reply_text(final_text)
+        
         with open(output_file, "rb") as file:
             await update.message.reply_document(
                 document=file,
                 filename=f"результаты_{user_id}.xlsx",
-                caption=(
-                    f"✅ Готово!\n"
-                    f"Успешно обработано: {processed - errors} строк\n"
-                    f"Ошибок: {errors}\n"
-                    f"API: GraphHopper"
-                )
+                caption="📊 Результаты расчета маршрутов"
             )
+            
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка отправки файла: {e}")
     
-    # Удаляем временные файлы
+    # Очищаем временные файлы
     try:
         if os.path.exists(input_file):
             os.remove(input_file)
         if os.path.exists(output_file):
             os.remove(output_file)
-    except Exception as e:
-        print(f"Ошибка удаления временных файлов: {e}")
+    except:
+        pass
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help"""
@@ -648,16 +642,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 /start - Начать работу с ботом
 /help - Показать эту справку
-/test - Проверить работу геокодирования и расчета маршрута
+/test - Проверить работу API
 
 📁 **Формат Excel файла:**
-• Колонка A: Стартовая точка (точка А)
-• Колонка B: Цепочка адресов через дефис
+• Колонка 1: Стартовая точка (точка А)
+• Колонка 2: Цепочка адресов через дефис
 
-📍 **Пример строки в колонке B:**
-`г. Воронеж, ул. Ипподромная 18А - г. Сергиев Посад, ул. Кирова 89`
+📍 **Пример строки:**
+`Ростов-на-Дону, Оганова 22`
+`Воронеж, ул. Ипподромная 18А - Сергиев Посад, ул. Кирова 89`
 
-📊 **Добавляемые колонки результатов:**
+📊 **Добавляемые колонки:**
 1. Статус обработки
 2. Координаты старта
 3. Координаты точек
@@ -667,157 +662,176 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 7. Расстояние 2 (км) - + вариант
 8. Расстояние 3 (км) - - вариант
 
-**Типы маршрутов:**
-• Прямой - один адрес в цепочке
-• С промежуточными точками - несколько адресов через дефис
-
-**Используемые API:**
-• Геокодирование: Яндекс Карты + GraphHopper
-• Расчет маршрутов: GraphHopper
+⚠️ **Ограничения:**
+• Максимум 10 точек в маршруте
+• API: GraphHopper (бесплатный тариф)
+• Геокодирование: только Россия и ближнее зарубежье
 """
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    await update.message.reply_text(help_text)
 
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Проверка работы API"""
-    test_address = "Москва, Красная площадь"
-    
     await update.message.reply_text("🧪 Проверяю работу API...")
     
-    # Тест геокодирования Яндекс
-    yandex_coords = yandex_geocode(test_address)
-    yandex_status = "✅ Работает" if yandex_coords else "❌ Ошибка"
+    test_address = "Москва, Красная площадь"
     
-    # Тест геокодирования GraphHopper
-    gh_coords = graphhopper_geocode(test_address)
-    gh_status = "✅ Работает" if gh_coords else "❌ Ошибка"
+    # Проверяем геокодирование
+    coords = graphhopper_geocode_enhanced(test_address)
     
-    # Тест расчета маршрута
-    route_status = "❌ Не удалось проверить"
-    if gh_coords:
-        # Создаем тестовый маршрут Москва-Санкт-Петербург
-        moscow_coords = gh_coords
-        spb_coords = graphhopper_geocode("Санкт-Петербург, Дворцовая площадь")
+    if coords:
+        await update.message.reply_text(
+            f"📍 **Геокодирование:** ✅ Работает\n"
+            f"Адрес: {test_address}\n"
+            f"Координаты: {coords[0]:.6f}, {coords[1]:.6f}"
+        )
         
+        # Проверяем расчет маршрута
+        spb_coords = graphhopper_geocode_enhanced("Санкт-Петербург, Дворцовая площадь")
         if spb_coords:
-            distance = graphhopper_route([moscow_coords, spb_coords])
-            route_status = f"✅ Работает (расстояние: {distance} км)" if distance else "❌ Ошибка расчета"
-    
-    await update.message.reply_text(
-        f"**Результаты тестирования:**\n\n"
-        f"📍 Яндекс Геокодирование: {yandex_status}\n"
-        f"📍 GraphHopper Геокодирование: {gh_status}\n"
-        f"🛣️ GraphHopper Маршруты: {route_status}\n\n"
-        f"**Статус API ключей:**\n"
-        f"• Яндекс API: {'✅ Установлен' if YANDEX_API_KEY else '❌ Отсутствует'}\n"
-        f"• GraphHopper API: {'✅ Установлен' if GRAPHOPPER_API_KEY else '❌ Отсутствует'}"
-    , parse_mode='Markdown')
+            distance = calculate_route_optimized([coords, spb_coords])
+            if distance:
+                await update.message.reply_text(
+                    f"🛣️ **Расчет маршрута:** ✅ Работает\n"
+                    f"Москва → Санкт-Петербург: {distance} км"
+                )
+            else:
+                await update.message.reply_text("🛣️ **Расчет маршрута:** ❌ Ошибка")
+    else:
+        await update.message.reply_text("📍 **Геокодирование:** ❌ Ошибка")
 
 async def example_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /example - отправляет пример файла"""
-    await update.message.reply_text(
-        "📋 Пример Excel файла:\n\n"
-        "| Колонка A | Колонка B |\n"
-        "|-----------|-----------|\n"
-        "| Ростов-на-Дону, Оганова 22 | г. Воронеж, ул. Ипподромная 18А |\n"
-        "| Ростов-на-Дону, Оганова 22 | г. Воронеж, ул. Ипподромная 18А - г. Сергиев Посад, ул. Кирова 89 |\n"
-        "| Ростов-на-Дону, Оганова 22 | р. Карелия, г. Петрозаводск, ул. Вольная 4 - г. Беломорск, ул. Мерецкова 6 |\n\n"
-        "Просто создайте Excel файл с такими данными и отправьте боту!"
-    )
+    """Отправляет пример файла"""
+    example_text = """
+📋 **Пример Excel файла:**
 
-# ================== ЗАПУСК С ЗАЩИТОЙ ОТ КОНФЛИКТОВ ==================
+| Стартовая точка | Цепочка адресов |
+|-----------------|-----------------|
+| Ростов-на-Дону, ул. Оганова 22 | Воронеж, ул. Ипподромная 18А |
+| Ростов-на-Дону, ул. Оганова 22 | Воронеж, ул. Ипподромная 18А - Сергиев Посад, ул. Кирова 89 |
+| Ростов-на-Дону, ул. Оганова 22 | Ярославль, ул. Магистральная 1 - Ростов Великий, ул. Покровская 42 |
+
+**Советы:**
+1. Используйте дефис `-` для разделения адресов в цепочке
+2. Указывайте адреса как можно полнее
+3. Избегайте специальных символов кроме запятых и дефисов
+"""
+    await update.message.reply_text(example_text)
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает статус бота"""
+    status_text = """
+🤖 **Статус бота:**
+
+✅ **API ключи:**
+• GraphHopper: {"установлен" if GRAPHOPPER_API_KEY else "❌ отсутствует"}
+• Яндекс: {"установлен" if YANDEX_API_KEY else "не установлен"}
+
+🔧 **Возможности:**
+• Геокодирование адресов
+• Расчет маршрутов с промежуточными точками
+• Обработка Excel файлов
+• Поддержка до 10 точек в маршруте
+
+📡 **Используемые сервисы:**
+• Основной: GraphHopper API
+• Резервный: Яндекс Геокодер
+"""
+    await update.message.reply_text(status_text)
+
+# ================== ЗАПУСК БОТА ==================
 async def run_bot():
-    """Запускает бота с обработкой конфликтов"""
+    """Запускает Telegram бота"""
     print("=" * 50)
     print("🚀 ЗАПУСК ТЕЛЕГРАМ БОТА")
     print("=" * 50)
     
     if not BOT_TOKEN:
         print("❌ ОШИБКА: BOT_TOKEN не установлен!")
-        print("Установите переменную окружения BOT_TOKEN в Render")
+        print("Установите переменную окружения BOT_TOKEN")
         return
     
-    print(f"✅ Токен получен")
-    print(f"✅ Яндекс API: {'установлен' if YANDEX_API_KEY else 'не установлен'}")
-    print(f"✅ GraphHopper API: {'установлен' if GRAPHOPPER_API_KEY else 'не установлен'}")
+    print("✅ Инициализация бота...")
     
     # Создаем приложение
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     
-    # Добавляем обработчики
+    # Добавляем обработчики команд
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("example", example_command))
     application.add_handler(CommandHandler("test", test_command))
+    application.add_handler(CommandHandler("status", status_command))
+    
+    # Добавляем обработчик документов
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
-    # Пытаемся запустить бота с обработкой конфликтов
-    max_retries = 5
-    retry_delay = 10  # секунд
+    # Настройка polling
+    await application.initialize()
+    await application.start()
     
-    for attempt in range(max_retries):
-        try:
-            print(f"🔄 Попытка {attempt + 1}/{max_retries} запустить бота...")
-            await application.initialize()
-            await application.start()
-            
-            # Получаем информацию о боте
-            bot_info = await application.bot.get_me()
-            print(f"✅ Бот запущен: @{bot_info.username}")
-            
-            # Запускаем polling
-            await application.updater.start_polling(
-                drop_pending_updates=True,
-                timeout=30,
-                poll_interval=0.5
-            )
-            
-            print("🤖 Бот работает и ожидает сообщений...")
-            print("📡 Используемые API:")
-            print(f"   • Геокодирование: Яндекс + GraphHopper")
-            print(f"   • Маршруты: GraphHopper")
-            print(f"   • Ключ GraphHopper: {'установлен' if GRAPHOPPER_API_KEY else 'нет'}")
-            
-            # Бесконечный цикл (пока не будет остановлен)
-            while True:
-                await asyncio.sleep(3600)  # Спим час
-            
-        except Conflict as e:
-            print(f"⚠️ Конфликт: {e}")
-            print(f"⏳ Жду {retry_delay} секунд перед повторной попыткой...")
-            
-            # Останавливаем бота если он запущен
-            try:
-                await application.stop()
-                await application.shutdown()
-            except:
-                pass
-            
-            if attempt < max_retries - 1:
-                await asyncio.sleep(retry_delay)
-                retry_delay *= 2  # Экспоненциальная задержка
-            else:
-                print("❌ Достигнут лимит попыток. Бот не может запуститься.")
-                print("ℹ️ Проверьте, что нет других запущенных экземпляров бота.")
-                break
-                
-        except Exception as e:
-            print(f"❌ Ошибка: {e}")
-            break
+    # Получаем информацию о боте
+    bot_info = await application.bot.get_me()
+    print(f"✅ Бот запущен: @{bot_info.username}")
+    print(f"   ID: {bot_info.id}")
+    print(f"   Имя: {bot_info.first_name}")
+    
+    # Запускаем polling
+    await application.updater.start_polling(
+        drop_pending_updates=True,
+        timeout=30,
+        poll_interval=0.5,
+        allowed_updates=Update.ALL_TYPES
+    )
+    
+    print("🤖 Бот готов к работе!")
+    print("📡 Ожидание сообщений...")
+    
+    # Бесконечный цикл
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except KeyboardInterrupt:
+        print("\n⏹️ Остановка бота...")
+        await application.stop()
 
 def main():
-    # Проверяем, работаем ли на Render
+    """Основная функция"""
+    # Проверяем переменные окружения
+    print("🔍 Проверка настроек...")
+    
+    required_vars = ["BOT_TOKEN", "GRAPHOPPER_API_KEY"]
+    missing_vars = []
+    
+    for var in required_vars:
+        if not os.getenv(var):
+            missing_vars.append(var)
+    
+    if missing_vars:
+        print(f"❌ Отсутствуют переменные окружения: {', '.join(missing_vars)}")
+        print("ℹ️ Установите их в настройках Render")
+        return
+    
+    print("✅ Все настройки проверены")
+    
+    # Проверяем работу на Render
     is_render = os.environ.get('RENDER') is not None
     port = os.environ.get('PORT')
     
     if is_render and port:
-        print(f"🌐 Работаем на Render, порт: {port}")
+        print(f"🌐 Запуск на Render, порт: {port}")
         # Запускаем Flask в отдельном потоке
         flask_thread = threading.Thread(target=run_flask, daemon=True)
         flask_thread.start()
-        print("✅ Flask сервер запущен в отдельном потоке")
+        print("✅ Flask сервер запущен")
     
     # Запускаем бота
-    asyncio.run(run_bot())
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        print("\n👋 Завершение работы")
+    except Exception as e:
+        print(f"❌ Критическая ошибка: {e}")
 
 if __name__ == "__main__":
     main()
+[file content end]
