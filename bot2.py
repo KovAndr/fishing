@@ -92,8 +92,7 @@ def run_flask():
 
 # ================== НАСТРОЙКИ БОТА ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "")
-ORS_API_KEY = os.getenv("ORS_API_KEY", "")
+GRAPHHOPPER_API_KEY = os.getenv("GRAPHHOPPER_API_KEY", "")
 
 # ================== ФУНКЦИИ ОБРАБОТКИ АДРЕСОВ ==================
 def extract_region_from_address(address):
@@ -234,11 +233,135 @@ def simplify_address_for_geocoding(address):
     if "Крым" in address or "Севастополь" in address or "Симферополь" in address:
         simplified = f"{settlement}, Республика Крым, Россия"
     elif "ДНР" in address or "Донецк" in address:
-        simplified = f"{settlement}, ДНР"
+        simplified = f"{settlement}, Россия"  # GraphHopper может не поддерживать ДНР
     elif "Херсон" in address or "Запорож" in address:
         simplified = f"{settlement}, Россия"
     
     return simplified
+
+# ================== GRAPHHOPPER API ФУНКЦИИ ==================
+def graphhopper_geocode(address):
+    """Геокодирование адреса через GraphHopper API"""
+    if not GRAPHHOPPER_API_KEY:
+        print("⚠️ GRAPHHOPPER_API_KEY не установлен!")
+        return None
+    
+    # Упрощаем адрес
+    simplified_address = simplify_address_for_geocoding(address)
+    
+    print(f"📍 GraphHopper геокодирует: {address[:50]}... -> {simplified_address}")
+    
+    url = "https://graphhopper.com/api/1/geocode"
+    params = {
+        "q": simplified_address,
+        "key": GRAPHHOPPER_API_KEY,
+        "locale": "ru",
+        "limit": 1
+    }
+    
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        
+        if r.status_code != 200:
+            print(f"⚠️ Ошибка геокодирования {r.status_code} для: {simplified_address}")
+            print(f"⚠️ Ответ: {r.text[:200]}")
+            return None
+        
+        data = r.json()
+        
+        if data.get("hits") and len(data["hits"]) > 0:
+            location = data["hits"][0]["point"]
+            # GraphHopper возвращает {"lat": xx, "lng": yy}
+            lat = location.get("lat")
+            lng = location.get("lng")
+            
+            if lat is not None and lng is not None:
+                coords = (float(lat), float(lng))
+                print(f"✅ Найдены координаты: {coords}")
+                return coords
+            else:
+                print(f"⚠️ Координаты не найдены в ответе: {data}")
+                return None
+        else:
+            print(f"⚠️ Адрес не найден: {simplified_address}")
+            # Попробуем без России
+            if simplified_address.endswith(", Россия"):
+                simplified_address_ru = simplified_address[:-7]
+                print(f"🔄 Пробую без 'Россия': {simplified_address_ru}")
+                params["q"] = simplified_address_ru
+                r = requests.get(url, params=params, timeout=30)
+                
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("hits") and len(data["hits"]) > 0:
+                        location = data["hits"][0]["point"]
+                        lat = location.get("lat")
+                        lng = location.get("lng")
+                        if lat is not None and lng is not None:
+                            coords = (float(lat), float(lng))
+                            print(f"✅ Найдены координаты (без России): {coords}")
+                            return coords
+            return None
+            
+    except Exception as e:
+        print(f"⚠️ Ошибка при геокодировании {address}: {e}")
+        return None
+
+def graphhopper_route_with_waypoints(coordinates_list):
+    """Строит маршрут через промежуточные точки через GraphHopper API"""
+    if not GRAPHHOPPER_API_KEY:
+        print("⚠️ GRAPHHOPPER_API_KEY не установлен!")
+        return None
+    
+    if len(coordinates_list) < 2:
+        return None
+    
+    url = "https://graphhopper.com/api/1/route"
+    
+    # Подготавливаем параметры для запроса
+    params = {
+        "key": GRAPHHOPPER_API_KEY,
+        "vehicle": "car",
+        "locale": "ru",
+        "instructions": "false",
+        "calc_points": "false",
+        "points_encoded": "false"
+    }
+    
+    # Добавляем точки маршрута
+    for i, coord in enumerate(coordinates_list):
+        params[f"point.{i}"] = f"{coord[0]},{coord[1]}"
+    
+    try:
+        print(f"📍 GraphHopper строит маршрут через {len(coordinates_list)} точек...")
+        
+        # GraphHopper рекомендует использовать POST для маршрутов с многими точками
+        # Преобразуем параметры в строку для GET запроса
+        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+        
+        r = requests.get(f"{url}?{query_string}", timeout=60)
+        
+        if r.status_code != 200:
+            print(f"⚠️ Ошибка маршрута: {r.status_code}")
+            print(f"⚠️ Ответ: {r.text[:200]}")
+            return None
+        
+        data = r.json()
+        
+        if data.get("paths") and len(data["paths"]) > 0:
+            path = data["paths"][0]
+            distance_meters = path.get("distance", 0)
+            distance_km = round(distance_meters / 1000, 1)
+            
+            print(f"✅ Маршрут построен: {distance_km} км")
+            return distance_km
+        else:
+            print(f"⚠️ Некорректный ответ от GraphHopper: {data}")
+            return None
+            
+    except Exception as e:
+        print(f"⚠️ Ошибка при построении маршрута: {e}")
+        return None
 
 # ================== ЛОГИКА БОТА ==================
 def read_from_docx(path):
@@ -272,91 +395,6 @@ def read_from_excel(path):
             })
     
     return routes, wb, ws
-
-def yandex_geocode(address):
-    """Геокодирование адреса через Яндекс API"""
-    if not YANDEX_API_KEY:
-        print("⚠️ YANDEX_API_KEY не установлен!")
-        return None
-    
-    # Упрощаем адрес
-    simplified_address = simplify_address_for_geocoding(address)
-    
-    print(f"📍 Геокодируем: {address[:50]}... -> {simplified_address}")
-    
-    url = "https://geocode-maps.yandex.ru/1.x/"
-    params = {
-        "apikey": YANDEX_API_KEY,
-        "format": "json",
-        "geocode": simplified_address,
-        "results": 1,
-        "lang": "ru_RU"
-    }
-    
-    try:
-        r = requests.get(url, params=params, timeout=30)
-        if r.status_code != 200:
-            print(f"⚠️ Ошибка геокодирования {r.status_code} для: {simplified_address}")
-            return None
-        
-        data = r.json()
-        if (data["response"]["GeoObjectCollection"]["featureMember"] and 
-            len(data["response"]["GeoObjectCollection"]["featureMember"]) > 0):
-            pos = data["response"]["GeoObjectCollection"]["featureMember"][0]["GeoObject"]["Point"]["pos"]
-            lon, lat = pos.split()
-            coords = (float(lat), float(lon))
-            print(f"✅ Найдены координаты: {coords}")
-            return coords
-        else:
-            print(f"⚠️ Адрес не найден: {simplified_address}")
-            return None
-    except Exception as e:
-        print(f"⚠️ Ошибка при геокодировании {address}: {e}")
-        return None
-
-def ors_route_with_waypoints(coordinates_list):
-    """Строит маршрут через промежуточные точки"""
-    if not ORS_API_KEY:
-        print("⚠️ ORS_API_KEY не установлен!")
-        return None
-    
-    if len(coordinates_list) < 2:
-        return None
-    
-    url = "https://api.openrouteservice.org/v2/directions/driving-car/geojson"
-    headers = {"Authorization": ORS_API_KEY}
-    
-    # Преобразуем координаты в формат [lon, lat]
-    coordinates = [[coord[1], coord[0]] for coord in coordinates_list]
-    
-    body = {"coordinates": coordinates}
-    
-    try:
-        print(f"📍 Строим маршрут через {len(coordinates)} точек...")
-        r = requests.post(url, json=body, headers=headers, timeout=60)
-        
-        if r.status_code != 200:
-            print(f"⚠️ Ошибка маршрута: {r.status_code}")
-            # Пробуем получить детали ошибки
-            try:
-                error_details = r.json()
-                print(f"⚠️ Детали ошибки: {error_details}")
-            except:
-                pass
-            return None
-        
-        data = r.json()
-        if data.get("features") and data["features"][0].get("properties", {}).get("summary"):
-            dist = data["features"][0]["properties"]["summary"]["distance"]
-            distance_km = round(dist / 1000, 1)
-            print(f"✅ Маршрут построен: {distance_km} км")
-            return distance_km
-        else:
-            print(f"⚠️ Некорректный ответ от ORS")
-            return None
-    except Exception as e:
-        print(f"⚠️ Ошибка при построении маршрута: {e}")
-        return None
 
 def variations(base):
     """Генерирует варианты расстояний"""
@@ -417,7 +455,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 Пример строки в колонке B:\n"
         "`г. Воронеж, ул. Ипподромная 18А - г. Сергиев Посад, ул. Кирова 89`\n\n"
         "✅ Я верну тот же файл с добавленными колонками результатов!\n\n"
-        "ℹ️ Примечание: Для геокодирования используются только населенные пункты и регионы."
+        "ℹ️ Примечание: Используется GraphHopper API для геокодирования и расчета маршрутов."
     )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -496,9 +534,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             if cache_key in geocode_cache:
                 start_coords = geocode_cache[cache_key]
+                print(f"✅ Координаты из кэша: {start_coords}")
             else:
-                start_coords = yandex_geocode(start_point)
-                time.sleep(1.5)  # Увеличиваем задержку для соблюдения лимитов API
+                start_coords = graphhopper_geocode(start_point)
+                time.sleep(0.5)  # Задержка для GraphHopper API
                 if start_coords:
                     geocode_cache[cache_key] = start_coords
             
@@ -522,9 +561,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 if cache_key in geocode_cache:
                     coords = geocode_cache[cache_key]
+                    print(f"✅ Координаты из кэша [{i+1}]: {coords}")
                 else:
-                    coords = yandex_geocode(addr)
-                    time.sleep(1.5)  # Увеличиваем задержку для соблюдения лимитов API
+                    coords = graphhopper_geocode(addr)
+                    time.sleep(0.5)  # Задержка для GraphHopper API
                     if coords:
                         geocode_cache[cache_key] = coords
                 
@@ -555,10 +595,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 print(f"📍 Построение маршрута через {len(full_coordinates)} точек...")
                 
                 # Рассчитываем маршрут
-                distance = ors_route_with_waypoints(full_coordinates)
-                time.sleep(3)  # Увеличиваем задержку для соблюдения лимитов ORS API
+                distance = graphhopper_route_with_waypoints(full_coordinates)
+                time.sleep(1)  # Задержка для GraphHopper API
                 
-                if distance:
+                if distance and distance > 0:
                     d2, d3 = variations(distance)
                     status = "✅ Успешно"
                     start_coords_str = f"{start_coords[0]:.6f},{start_coords[1]:.6f}"
@@ -659,10 +699,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"• Ошибок: {errors}\n"
                     f"  └ Геокодирование: {geocode_errors}\n"
                     f"  └ Расчет маршрутов: {route_errors}\n\n"
-                    f"ℹ️ Примечания:\n"
-                    f"• Для геокодирования используются населенные пункты\n"
-                    f"• Регион из первого адреса применяется к последующим\n"
-                    f"• Улицы и номера домов игнорируются"
+                    f"ℹ️ Использован GraphHopper API\n"
+                    f"• Геокодирование: населенные пункты\n"
+                    f"• Расчет маршрутов: автомобиль"
                 )
             )
     except Exception as e:
@@ -703,13 +742,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 8. Расстояние 3 (км)
 
 **🔥 Особенности обработки:**
-• Используются только населенные пункты (города, села, поселки)
+• Используется GraphHopper API
+• Геокодирование: только населенные пункты
+• Расчет маршрутов: автомобильные дороги
 • Улицы и номера домов игнорируются
-• Регион из первого адреса применяется к последующим адресам в цепочке
-• Для геокодирования добавляется "Россия"
+• Регион из первого адреса применяется к последующим
 
 **⏱️ Время обработки:**
-• ~3-5 секунд на строку
+• ~2-3 секунды на строку
 • Для больших файлов может потребоваться время
 """
     await update.message.reply_text(help_text, parse_mode='Markdown')
@@ -740,8 +780,7 @@ async def run_bot():
         return
     
     print(f"✅ Токен получен")
-    print(f"✅ Яндекс API: {'установлен' if YANDEX_API_KEY else 'не установлен'}")
-    print(f"✅ ORS API: {'установлен' if ORS_API_KEY else 'не установлен'}")
+    print(f"✅ GraphHopper API: {'установлен' if GRAPHHOPPER_API_KEY else 'не установлен'}")
     
     # Создаем приложение
     application = ApplicationBuilder().token(BOT_TOKEN).build()
